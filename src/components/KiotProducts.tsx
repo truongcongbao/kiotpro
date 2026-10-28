@@ -5,7 +5,7 @@ import * as XLSX from "xlsx";
 import { 
   Search, Plus, Edit2, Trash2, Tag, Layers, CheckCircle, AlertTriangle, 
   ArrowUpDown, Filter, Upload, Download, RefreshCw, Clipboard, Calendar, FileText,
-  User, DollarSign, ShoppingBag, PlusCircle, MinusCircle, Truck
+  User, DollarSign, ShoppingBag, PlusCircle, MinusCircle, Truck, Lock
 } from "lucide-react";
 
 interface KiotProductsProps {
@@ -42,6 +42,19 @@ export default function KiotProducts({
   onAddPurchaseOrder
 }: KiotProductsProps) {
   
+  const hasPermission = (perm: "productCreateEdit" | "productDelete" | "inventoryAudit") => {
+    if (!currentStaff) return true;
+    if (currentStaff.role === "OWNER") return true;
+    if (currentStaff.permissions?.[perm] !== undefined) {
+      return currentStaff.permissions[perm];
+    }
+    if (currentStaff.role === "MANAGER") {
+      if (perm === "productDelete") return false;
+      return true;
+    }
+    return false;
+  };
+
   // Tab within products: Products List or Categories or Inventory Audit or Purchase Order
   const [activeSubTab, setActiveSubTab] = useState<"list" | "audit" | "purchase">("list");
   
@@ -907,24 +920,32 @@ export default function KiotProducts({
           </button>
 
           <button
+            disabled={!hasPermission("inventoryAudit")}
             onClick={() => setActiveSubTab("audit")}
-            className={`pb-3 text-sm font-bold uppercase tracking-wider relative cursor-pointer ${
+            className={`pb-3 text-sm font-bold uppercase tracking-wider relative cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${
               activeSubTab === "audit" ? "text-emerald-400" : "text-stone-500 hover:text-stone-300"
             }`}
           >
-            <span>Phiếu Kiểm Kho</span>
+            <span className="flex items-center gap-1">
+              {!hasPermission("inventoryAudit") && <Lock className="h-3.5 w-3.5 text-rose-500 shrink-0" />}
+              <span>Phiếu Kiểm Kho</span>
+            </span>
             {activeSubTab === "audit" && (
               <div className="absolute bottom-0 inset-x-0 h-0.5 bg-emerald-500 shadow-[0_0_10px_rgba(16,185,129,0.5)]" />
             )}
           </button>
 
           <button
+            disabled={!hasPermission("inventoryAudit")}
             onClick={() => setActiveSubTab("purchase")}
-            className={`pb-3 text-sm font-bold uppercase tracking-wider relative cursor-pointer ${
+            className={`pb-3 text-sm font-bold uppercase tracking-wider relative cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${
               activeSubTab === "purchase" ? "text-emerald-400" : "text-stone-500 hover:text-stone-300"
             }`}
           >
-            <span>Nhập Hàng (Giá vốn)</span>
+            <span className="flex items-center gap-1">
+              {!hasPermission("inventoryAudit") && <Lock className="h-3.5 w-3.5 text-rose-500 shrink-0" />}
+              <span>Nhập Hàng (Giá vốn)</span>
+            </span>
             {activeSubTab === "purchase" && (
               <div className="absolute bottom-0 inset-x-0 h-0.5 bg-emerald-500 shadow-[0_0_10px_rgba(16,185,129,0.5)]" />
             )}
@@ -934,11 +955,12 @@ export default function KiotProducts({
          {activeSubTab === "list" && (
           <div className="flex gap-2">
             <button
+              disabled={!hasPermission("productCreateEdit")}
               onClick={() => setIsImportModalOpen(true)}
-              className="px-3 py-1.5 rounded-lg text-xs bg-stone-950 border border-stone-850 hover:bg-stone-900 text-stone-300 flex items-center gap-1.5 transition-all cursor-pointer"
-              title="Nhập hàng loạt sản phẩm từ file Excel (CSV)"
+              className="px-3 py-1.5 rounded-lg text-xs bg-stone-950 border border-stone-850 hover:bg-stone-900 text-stone-300 flex items-center gap-1.5 transition-all cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+              title={hasPermission("productCreateEdit") ? "Nhập hàng loạt sản phẩm từ file Excel (CSV)" : "Không có quyền nhập Excel"}
             >
-              <Upload className="h-3.5 w-3.5 text-indigo-400" />
+              {hasPermission("productCreateEdit") ? <Upload className="h-3.5 w-3.5 text-indigo-400" /> : <Lock className="h-3.5 w-3.5 text-rose-500" />}
               <span>Nhập Excel</span>
             </button>
             <button
@@ -950,17 +972,19 @@ export default function KiotProducts({
               <span>Xuất Excel</span>
             </button>
             <button
+              disabled={!hasPermission("productCreateEdit")}
               onClick={() => setIsCategoryModalOpen(true)}
-              className="px-3 py-1.5 rounded-lg text-xs bg-stone-950 border border-stone-850 hover:bg-stone-900 text-stone-300 flex items-center gap-1.5 transition-all cursor-pointer"
+              className="px-3 py-1.5 rounded-lg text-xs bg-stone-950 border border-stone-850 hover:bg-stone-900 text-stone-300 flex items-center gap-1.5 transition-all cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
             >
-              <Plus className="h-3.5 w-3.5 text-amber-500" />
+              {hasPermission("productCreateEdit") ? <Plus className="h-3.5 w-3.5 text-amber-500" /> : <Lock className="h-3.5 w-3.5 text-rose-500" />}
               <span>Thêm danh mục</span>
             </button>
             <button
+              disabled={!hasPermission("productCreateEdit")}
               onClick={() => handleOpenProductModal(null)}
-              className="px-4 py-1.5 rounded-lg text-xs bg-emerald-500 hover:bg-emerald-400 text-stone-950 font-black uppercase flex items-center gap-1.5 transition-all shadow-md"
+              className="px-4 py-1.5 rounded-lg text-xs bg-emerald-500 hover:bg-emerald-400 text-stone-950 font-black uppercase flex items-center gap-1.5 transition-all shadow-md disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
             >
-              <Plus className="h-4 w-4" />
+              {hasPermission("productCreateEdit") ? <Plus className="h-4 w-4" /> : <Lock className="h-4 w-4 text-stone-850" />}
               <span>Thêm sản phẩm</span>
             </button>
           </div>
@@ -1157,16 +1181,20 @@ export default function KiotProducts({
                           <td className="p-4 text-right">
                             <div className="flex items-center justify-end gap-2">
                               <button
+                                disabled={!hasPermission("productCreateEdit")}
                                 onClick={() => handleOpenProductModal(p)}
-                                className="p-2 bg-stone-950 hover:bg-stone-800 text-stone-400 hover:text-stone-100 rounded-lg transition-all border border-stone-850 cursor-pointer"
+                                className="p-2 bg-stone-950 hover:bg-stone-800 text-stone-400 hover:text-stone-100 disabled:opacity-30 disabled:cursor-not-allowed rounded-lg transition-all border border-stone-850 cursor-pointer"
+                                title={hasPermission("productCreateEdit") ? "Chỉnh sửa sản phẩm" : "Bạn không có quyền sửa sản phẩm"}
                               >
-                                <Edit2 className="h-3.5 w-3.5" />
+                                {hasPermission("productCreateEdit") ? <Edit2 className="h-3.5 w-3.5" /> : <Lock className="h-3.5 w-3.5 text-stone-500" />}
                               </button>
                               <button
+                                disabled={!hasPermission("productDelete")}
                                 onClick={() => handleDeleteProductClick(p.id, p.name)}
-                                className="p-2 bg-stone-950 hover:bg-rose-950/40 text-stone-400 hover:text-rose-400 rounded-lg transition-all border border-stone-850 cursor-pointer"
+                                className="p-2 bg-stone-950 hover:bg-rose-950/40 text-stone-400 hover:text-rose-400 disabled:opacity-30 disabled:cursor-not-allowed rounded-lg transition-all border border-stone-850 cursor-pointer"
+                                title={hasPermission("productDelete") ? "Xóa sản phẩm" : "Bạn không có quyền xóa sản phẩm"}
                               >
-                                <Trash2 className="h-3.5 w-3.5" />
+                                {hasPermission("productDelete") ? <Trash2 className="h-3.5 w-3.5" /> : <Lock className="h-3.5 w-3.5 text-stone-500" />}
                               </button>
                             </div>
                           </td>

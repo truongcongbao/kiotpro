@@ -2,7 +2,7 @@ import React, { useState, useMemo } from "react";
 import { Customer, Supplier, Staff, CashbookEntry } from "../types";
 import { 
   Search, Plus, Edit2, Trash2, Users, Briefcase, Award, CheckCircle, 
-  MapPin, Phone, Mail, Award as AwardIcon, Star, Sparkles, Receipt, DollarSign, Wallet
+  MapPin, Phone, Mail, Award as AwardIcon, Star, Sparkles, Receipt, DollarSign, Wallet, Lock
 } from "lucide-react";
 import { safeDispatchEvent } from "../lib/events";
 
@@ -32,6 +32,19 @@ export default function KiotPartners({
   onAddCashbookEntry
 }: KiotPartnersProps) {
   
+  const hasPermission = (perm: "partnerCreateEdit" | "partnerDelete" | "partnerDebtAdjust") => {
+    if (!currentStaff) return true;
+    if (currentStaff.role === "OWNER") return true;
+    if (currentStaff.permissions?.[perm] !== undefined) {
+      return currentStaff.permissions[perm];
+    }
+    if (currentStaff.role === "MANAGER") {
+      if (perm === "partnerDelete") return false;
+      return true;
+    }
+    return false;
+  };
+
   const [activeTab, setActiveTab] = useState<"customers" | "suppliers">("customers");
   
   // Search & Filter
@@ -87,6 +100,14 @@ export default function KiotPartners({
   }, [suppliers, searchQuery]);
 
   const handleCollectDebt = (customer: Customer) => {
+    if (!hasPermission("partnerDebtAdjust")) {
+      safeDispatchEvent("kiot-toast", {
+        type: "error",
+        title: "TỪ CHỐI TRUY CẬP 🚫",
+        message: "Tài khoản của bạn không có quyền Thu hồi nợ đối tác!"
+      });
+      return;
+    }
     const currentDebt = customer.debt || 0;
     if (currentDebt <= 0) return;
 
@@ -134,6 +155,14 @@ export default function KiotPartners({
   };
 
   const handlePaySupplierDebt = (supplier: Supplier) => {
+    if (!hasPermission("partnerDebtAdjust")) {
+      safeDispatchEvent("kiot-toast", {
+        type: "error",
+        title: "TỪ CHỐI TRUY CẬP 🚫",
+        message: "Tài khoản của bạn không có quyền Trả nợ nhà cung cấp!"
+      });
+      return;
+    }
     const currentDebt = supplier.debt || 0;
     if (currentDebt <= 0) return;
 
@@ -236,15 +265,20 @@ export default function KiotPartners({
     setIsCustomerModalOpen(false);
   };
 
+  // Partner to delete state for modal
+  const [partnerToDelete, setPartnerToDelete] = useState<{ id: string; name: string; type: "customer" | "supplier" } | null>(null);
+
   // Delete Customer
   const handleDeleteCustomerClick = (id: string, name: string) => {
     if (id === "cust-4") {
-      alert("Không thể xóa tài khoản Khách vãng lai mặc định của hệ thống!");
+      safeDispatchEvent("kiot-toast", {
+        type: "error",
+        title: "Không thể xóa",
+        message: "Không thể xóa tài khoản Khách vãng lai mặc định của hệ thống!"
+      });
       return;
     }
-    if (confirm(`Bạn có chắc muốn xóa khách hàng "${name}" khỏi hệ thống?`)) {
-      onDeleteCustomer(id);
-    }
+    setPartnerToDelete({ id, name, type: "customer" });
   };
 
   // Handle open Supplier Modal
@@ -298,9 +332,7 @@ export default function KiotPartners({
 
   // Delete Supplier
   const handleDeleteSupplierClick = (id: string, name: string) => {
-    if (confirm(`Bạn có chắc muốn xóa nhà cung cấp "${name}" khỏi hệ thống?`)) {
-      onDeleteSupplier(id);
-    }
+    setPartnerToDelete({ id, name, type: "supplier" });
   };
 
   return (
@@ -341,10 +373,12 @@ export default function KiotPartners({
         </div>
 
         <button
+          disabled={!hasPermission("partnerCreateEdit")}
           onClick={() => activeTab === "customers" ? handleOpenCustomerModal(null) : handleOpenSupplierModal(null)}
-          className="px-4 py-1.5 rounded-lg text-xs bg-emerald-500 hover:bg-emerald-400 text-stone-950 font-black uppercase flex items-center gap-1.5 transition-all shadow-md cursor-pointer"
+          className="px-4 py-1.5 rounded-lg text-xs bg-emerald-500 hover:bg-emerald-400 text-stone-950 font-black uppercase flex items-center gap-1.5 transition-all shadow-md cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+          title={hasPermission("partnerCreateEdit") ? "" : "Bạn không có quyền thêm đối tác"}
         >
-          <Plus className="h-4 w-4" />
+          {hasPermission("partnerCreateEdit") ? <Plus className="h-4 w-4" /> : <Lock className="h-4 w-4 text-stone-850" />}
           <span>{activeTab === "customers" ? "Thêm khách hàng" : "Thêm nhà cung cấp"}</span>
         </button>
       </div>
@@ -507,27 +541,30 @@ export default function KiotPartners({
                               <div className="flex items-center justify-end gap-2">
                                 {c.debt && c.debt > 0 ? (
                                   <button
+                                    disabled={!hasPermission("partnerDebtAdjust")}
                                     onClick={() => handleCollectDebt(c)}
-                                    className="px-2.5 py-1.5 bg-emerald-950/40 hover:bg-emerald-900/60 text-emerald-400 rounded-lg border border-emerald-900/30 cursor-pointer flex items-center gap-1 text-[10px] font-bold uppercase tracking-wider"
-                                    title="Thu nợ khách hàng"
+                                    className="px-2.5 py-1.5 bg-emerald-950/40 hover:bg-emerald-900/60 text-emerald-400 disabled:opacity-30 disabled:cursor-not-allowed rounded-lg border border-emerald-900/30 cursor-pointer flex items-center gap-1 text-[10px] font-bold uppercase tracking-wider"
+                                    title={hasPermission("partnerDebtAdjust") ? "Thu nợ khách hàng" : "Không có quyền thu nợ"}
                                   >
-                                    <Receipt className="h-3 w-3" />
+                                    {hasPermission("partnerDebtAdjust") ? <Receipt className="h-3 w-3" /> : <Lock className="h-3 w-3 text-stone-500" />}
                                     <span>Thu nợ</span>
                                   </button>
                                 ) : null}
                                 <button
+                                  disabled={!hasPermission("partnerCreateEdit")}
                                   onClick={() => handleOpenCustomerModal(c)}
-                                  className="p-2 bg-stone-950 hover:bg-stone-800 text-stone-400 hover:text-stone-100 rounded-lg border border-stone-850 cursor-pointer"
-                                  title="Chỉnh sửa thông tin"
+                                  className="p-2 bg-stone-950 hover:bg-stone-800 text-stone-400 hover:text-stone-100 disabled:opacity-30 disabled:cursor-not-allowed rounded-lg border border-stone-850 cursor-pointer"
+                                  title={hasPermission("partnerCreateEdit") ? "Chỉnh sửa thông tin" : "Không có quyền sửa thông tin"}
                                 >
-                                  <Edit2 className="h-3.5 w-3.5" />
+                                  {hasPermission("partnerCreateEdit") ? <Edit2 className="h-3.5 w-3.5" /> : <Lock className="h-3.5 w-3.5 text-stone-500" />}
                                 </button>
                                 <button
+                                  disabled={!hasPermission("partnerDelete")}
                                   onClick={() => handleDeleteCustomerClick(c.id, c.name)}
-                                  className="p-2 bg-stone-950 hover:bg-rose-950/40 text-stone-400 hover:text-rose-400 rounded-lg border border-stone-850 cursor-pointer"
-                                  title="Xóa đối tác"
+                                  className="p-2 bg-stone-950 hover:bg-rose-950/40 text-stone-400 hover:text-rose-400 disabled:opacity-30 disabled:cursor-not-allowed rounded-lg border border-stone-850 cursor-pointer"
+                                  title={hasPermission("partnerDelete") ? "Xóa đối tác" : "Không có quyền xóa đối tác"}
                                 >
-                                  <Trash2 className="h-3.5 w-3.5" />
+                                  {hasPermission("partnerDelete") ? <Trash2 className="h-3.5 w-3.5" /> : <Lock className="h-3.5 w-3.5 text-stone-500" />}
                                 </button>
                               </div>
                             )}
@@ -627,27 +664,30 @@ export default function KiotPartners({
                           <div className="flex items-center justify-end gap-2">
                             {s.debt && s.debt > 0 ? (
                               <button
+                                disabled={!hasPermission("partnerDebtAdjust")}
                                 onClick={() => handlePaySupplierDebt(s)}
-                                className="px-2.5 py-1.5 bg-rose-950/40 hover:bg-rose-900/60 text-rose-400 rounded-lg border border-rose-900/30 cursor-pointer flex items-center gap-1 text-[10px] font-bold uppercase tracking-wider"
-                                title="Trả tiền nợ nhà cung cấp"
+                                className="px-2.5 py-1.5 bg-rose-950/40 hover:bg-rose-900/60 text-rose-400 disabled:opacity-30 disabled:cursor-not-allowed rounded-lg border border-rose-900/30 cursor-pointer flex items-center gap-1 text-[10px] font-bold uppercase tracking-wider"
+                                title={hasPermission("partnerDebtAdjust") ? "Trả tiền nợ nhà cung cấp" : "Không có quyền thanh toán nợ"}
                               >
-                                <Receipt className="h-3 w-3" />
+                                {hasPermission("partnerDebtAdjust") ? <Receipt className="h-3 w-3" /> : <Lock className="h-3 w-3 text-stone-500" />}
                                 <span>Trả nợ</span>
                               </button>
                             ) : null}
                             <button
+                              disabled={!hasPermission("partnerCreateEdit")}
                               onClick={() => handleOpenSupplierModal(s)}
-                              className="p-2 bg-stone-950 hover:bg-stone-800 text-stone-400 hover:text-stone-100 rounded-lg border border-stone-850 cursor-pointer"
-                              title="Chỉnh sửa thông tin"
+                              className="p-2 bg-stone-950 hover:bg-stone-800 text-stone-400 hover:text-stone-100 disabled:opacity-30 disabled:cursor-not-allowed rounded-lg border border-stone-850 cursor-pointer"
+                              title={hasPermission("partnerCreateEdit") ? "Chỉnh sửa thông tin" : "Không có quyền sửa thông tin"}
                             >
-                              <Edit2 className="h-3.5 w-3.5" />
+                              {hasPermission("partnerCreateEdit") ? <Edit2 className="h-3.5 w-3.5" /> : <Lock className="h-3.5 w-3.5 text-stone-500" />}
                             </button>
                             <button
+                              disabled={!hasPermission("partnerDelete")}
                               onClick={() => handleDeleteSupplierClick(s.id, s.name)}
-                              className="p-2 bg-stone-950 hover:bg-rose-950/40 text-stone-400 hover:text-rose-400 rounded-lg border border-stone-850 cursor-pointer"
-                              title="Xóa nhà cung cấp"
+                              className="p-2 bg-stone-950 hover:bg-rose-950/40 text-stone-400 hover:text-rose-400 disabled:opacity-30 disabled:cursor-not-allowed rounded-lg border border-stone-850 cursor-pointer"
+                              title={hasPermission("partnerDelete") ? "Xóa nhà cung cấp" : "Không có quyền xóa nhà cung cấp"}
                             >
-                              <Trash2 className="h-3.5 w-3.5" />
+                              {hasPermission("partnerDelete") ? <Trash2 className="h-3.5 w-3.5" /> : <Lock className="h-3.5 w-3.5 text-stone-500" />}
                             </button>
                           </div>
                         </td>
@@ -887,6 +927,58 @@ export default function KiotPartners({
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL XÁC NHẬN XÓA ĐỐI TÁC */}
+      {partnerToDelete && (
+        <div 
+          className="fixed inset-0 bg-stone-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4 animate-fadeIn"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) setPartnerToDelete(null);
+          }}
+        >
+          <div className="w-full max-w-sm bg-stone-900 border border-stone-800 rounded-2xl shadow-2xl p-6 space-y-4 text-stone-200">
+            <div className="flex items-center gap-3">
+              <div className="p-3 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-400 shrink-0">
+                <Trash2 className="h-6 w-6" />
+              </div>
+              <div>
+                <h3 className="text-sm font-bold text-stone-100">
+                  {partnerToDelete.type === "customer" ? "Xóa khách hàng?" : "Xóa nhà cung cấp?"}
+                </h3>
+                <p className="text-xs text-stone-400 mt-0.5">
+                  Bạn có chắc chắn muốn xóa <strong className="text-rose-400">"{partnerToDelete.name}"</strong> khỏi hệ thống?
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-3 pt-2">
+              <button
+                type="button"
+                onClick={() => setPartnerToDelete(null)}
+                className="px-4 py-2 rounded-xl text-xs font-bold bg-stone-800 hover:bg-stone-700 text-stone-300 transition-all cursor-pointer"
+              >
+                Hủy bỏ
+              </button>
+              <button
+                type="button"
+                autoFocus
+                onClick={() => {
+                  if (partnerToDelete.type === "customer") {
+                    onDeleteCustomer(partnerToDelete.id);
+                  } else {
+                    onDeleteSupplier(partnerToDelete.id);
+                  }
+                  setPartnerToDelete(null);
+                }}
+                className="px-4 py-2 rounded-xl text-xs font-black bg-rose-600 hover:bg-rose-500 text-white transition-all shadow-md flex items-center gap-1.5 cursor-pointer active:scale-95"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+                <span>Đồng ý xóa</span>
+              </button>
+            </div>
           </div>
         </div>
       )}

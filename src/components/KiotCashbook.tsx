@@ -24,6 +24,18 @@ export default function KiotCashbook({
   onSaveShifts = () => {},
   invoices = []
 }: KiotCashbookProps) {
+  const hasPermission = (perm: "cashbookCreateEntry" | "cashbookDeleteEntry") => {
+    if (!currentStaff) return true;
+    if (currentStaff.role === "OWNER") return true;
+    if (currentStaff.permissions?.[perm] !== undefined) {
+      return currentStaff.permissions[perm];
+    }
+    if (currentStaff.role === "MANAGER") {
+      return true;
+    }
+    return false;
+  };
+
   const [showAddModal, setShowAddModal] = useState(false);
   const [modalType, setModalType] = useState<"INCOME" | "EXPENSE">("INCOME");
   const [amount, setAmount] = useState<number>(0);
@@ -179,6 +191,14 @@ export default function KiotCashbook({
   }, [activeShift, invoices, cashbook]);
 
   const handleOpenShift = () => {
+    if (!hasPermission("cashbookCreateEntry")) {
+      safeDispatchEvent("kiot-toast", {
+        type: "error",
+        title: "TỪ CHỐI TRUY CẬP 🚫",
+        message: "Tài khoản của bạn không có quyền mở ca bán hàng!"
+      });
+      return;
+    }
     if (initialCashInput < 0) {
       alert("Số dư đầu ca không thể nhỏ hơn 0");
       return;
@@ -206,11 +226,19 @@ export default function KiotCashbook({
     safeDispatchEvent("kiot-toast", {
       type: "success",
       title: "Khởi tạo ca thành công! 🔓",
-      message: `Ca bán hàng ${newShift.code} hoạt động với số dư tiền lẻ đầu ca là ${initialCashInput.toLocaleString("vi-VN")}đ.`
+      message: `Ca bán hàng ${newShift.code} hoạt động with số dư tiền lẻ đầu ca là ${initialCashInput.toLocaleString("vi-VN")}đ.`
     });
   };
 
   const handleCloseActiveShift = () => {
+    if (!hasPermission("cashbookCreateEntry")) {
+      safeDispatchEvent("kiot-toast", {
+        type: "error",
+        title: "TỪ CHỐI TRUY CẬP 🚫",
+        message: "Tài khoản của bạn không có quyền chốt ca bàn giao!"
+      });
+      return;
+    }
     if (!activeShift) return;
 
     const confirmClose = confirm("Bạn có chắc chắn muốn CHỐT CA BÁN HÀNG và lưu biên bản bàn giao quỹ?");
@@ -394,26 +422,30 @@ export default function KiotCashbook({
             {/* CTAs */}
             <div className="flex flex-wrap gap-2 w-full sm:w-auto">
               <button
+                disabled={!hasPermission("cashbookCreateEntry")}
                 onClick={() => {
                   setModalType("INCOME");
                   setCategory(categories.INCOME[0]);
                   setShowAddModal(true);
                 }}
-                className="px-3.5 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-stone-950 text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer shadow-lg shadow-emerald-500/10 select-none"
+                className="px-3.5 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-stone-950 text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer shadow-lg shadow-emerald-500/10 select-none disabled:opacity-40 disabled:cursor-not-allowed"
+                title={hasPermission("cashbookCreateEntry") ? "Tạo phiếu thu dòng tiền mới" : "Bạn không có quyền lập phiếu thu"}
               >
-                <PlusCircle className="h-4 w-4" />
+                {hasPermission("cashbookCreateEntry") ? <PlusCircle className="h-4 w-4" /> : <Lock className="h-4 w-4 text-stone-850" />}
                 <span>Tạo Phiếu Thu</span>
               </button>
 
               <button
+                disabled={!hasPermission("cashbookCreateEntry")}
                 onClick={() => {
                   setModalType("EXPENSE");
                   setCategory(categories.EXPENSE[0]);
                   setShowAddModal(true);
                 }}
-                className="px-3.5 py-2 rounded-xl bg-rose-500 hover:bg-rose-400 text-stone-950 text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer shadow-lg shadow-rose-500/10 select-none"
+                className="px-3.5 py-2 rounded-xl bg-rose-500 hover:bg-rose-400 text-stone-950 text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer shadow-lg shadow-rose-500/10 select-none disabled:opacity-40 disabled:cursor-not-allowed"
+                title={hasPermission("cashbookCreateEntry") ? "Tạo phiếu chi dòng tiền mới" : "Bạn không có quyền lập phiếu chi"}
               >
-                <PlusCircle className="h-4 w-4" />
+                {hasPermission("cashbookCreateEntry") ? <PlusCircle className="h-4 w-4" /> : <Lock className="h-4 w-4 text-stone-850" />}
                 <span>Tạo Phiếu Chi</span>
               </button>
             </div>
@@ -715,9 +747,11 @@ export default function KiotCashbook({
 
                   {/* Completion CTAs */}
                   <button
+                    disabled={!hasPermission("cashbookCreateEntry")}
                     type="button"
                     onClick={handleCloseActiveShift}
-                    className="w-full py-3 bg-emerald-500 hover:bg-emerald-400 text-stone-950 font-black uppercase text-xs rounded-xl shadow-lg transition-all cursor-pointer flex items-center justify-center gap-2 select-none"
+                    className="w-full py-3 bg-emerald-500 hover:bg-emerald-400 text-stone-950 font-black uppercase text-xs rounded-xl shadow-lg transition-all cursor-pointer flex items-center justify-center gap-2 select-none disabled:opacity-40 disabled:cursor-not-allowed"
+                    title={hasPermission("cashbookCreateEntry") ? "Hoàn tất chốt ca bàn giao quỹ" : "Bạn không có quyền chốt ca"}
                   >
                     <Lock className="h-4.5 w-4.5" />
                     <span>Hoàn Tất Chốt Ca &amp; Bàn Giao Quỹ</span>
@@ -754,9 +788,11 @@ export default function KiotCashbook({
               </div>
 
               <button
+                disabled={!hasPermission("cashbookCreateEntry")}
                 type="button"
                 onClick={handleOpenShift}
-                className="w-full py-3 bg-emerald-500 hover:bg-emerald-400 text-stone-950 font-black uppercase text-xs rounded-xl shadow-lg transition-all cursor-pointer flex items-center justify-center gap-2 select-none"
+                className="w-full py-3 bg-emerald-500 hover:bg-emerald-400 text-stone-950 font-black uppercase text-xs rounded-xl shadow-lg transition-all cursor-pointer flex items-center justify-center gap-2 select-none disabled:opacity-40 disabled:cursor-not-allowed"
+                title={hasPermission("cashbookCreateEntry") ? "Bắt đầu ca bán hàng mới" : "Bạn không có quyền bắt đầu ca"}
               >
                 <Unlock className="h-4 w-4" />
                 <span>Bắt Đầu Phiên Ca Mới</span>

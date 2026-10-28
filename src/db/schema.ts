@@ -1,5 +1,5 @@
 import { relations } from 'drizzle-orm';
-import { integer, pgTable, serial, text, timestamp, boolean, doublePrecision, jsonb } from 'drizzle-orm/pg-core';
+import { integer, pgTable, serial, text, timestamp, boolean, doublePrecision, jsonb, primaryKey } from 'drizzle-orm/pg-core';
 
 // Define 'users' table
 export const users = pgTable('users', {
@@ -54,12 +54,13 @@ export const trials = pgTable('trials', {
   createdAt: text('created_at').notNull(),
   expireDate: text('expire_date').notNull(),
   status: text('status').default('TRIAL_ACTIVE').notNull(),
+  allowedModules: jsonb('allowed_modules'),
 });
 
 // 2. Products table
 export const products = pgTable('products', {
-  id: text('id').primaryKey().notNull(),
-  trialId: text('trial_id'),
+  id: text('id').notNull(),
+  trialId: text('trial_id').notNull(),
   code: text('code').notNull(),
   name: text('name').notNull(),
   barcode: text('barcode'),
@@ -73,21 +74,25 @@ export const products = pgTable('products', {
   expiryDate: text('expiry_date'),
   parentUnitId: text('parent_unit_id'),
   conversionRate: doublePrecision('conversion_rate'),
-});
+}, (table) => [
+  primaryKey({ columns: [table.id, table.trialId] })
+]);
 
 // 3. Categories table
 export const categories = pgTable('categories', {
-  id: text('id').primaryKey().notNull(),
-  trialId: text('trial_id'),
+  id: text('id').notNull(),
+  trialId: text('trial_id').notNull(),
   name: text('name').notNull(),
   description: text('description'),
   icon: text('icon'),
-});
+}, (table) => [
+  primaryKey({ columns: [table.id, table.trialId] })
+]);
 
 // 4. Customers table
 export const customers = pgTable('customers', {
-  id: text('id').primaryKey().notNull(),
-  trialId: text('trial_id'),
+  id: text('id').notNull(),
+  trialId: text('trial_id').notNull(),
   name: text('name').notNull(),
   phone: text('phone').notNull(),
   email: text('email'),
@@ -97,24 +102,28 @@ export const customers = pgTable('customers', {
   tier: text('tier').notNull(),
   avatar: text('avatar'),
   debt: doublePrecision('debt'),
-});
+}, (table) => [
+  primaryKey({ columns: [table.id, table.trialId] })
+]);
 
 // 5. Suppliers table
 export const suppliers = pgTable('suppliers', {
-  id: text('id').primaryKey().notNull(),
-  trialId: text('trial_id'),
+  id: text('id').notNull(),
+  trialId: text('trial_id').notNull(),
   name: text('name').notNull(),
   phone: text('phone').notNull(),
   email: text('email'),
   address: text('address'),
   companyName: text('company_name'),
   debt: doublePrecision('debt'),
-});
+}, (table) => [
+  primaryKey({ columns: [table.id, table.trialId] })
+]);
 
 // 6. Invoices table
 export const invoices = pgTable('invoices', {
-  id: text('id').primaryKey().notNull(),
-  trialId: text('trial_id'),
+  id: text('id').notNull(),
+  trialId: text('trial_id').notNull(),
   invoiceCode: text('invoice_code').notNull(),
   customerId: text('customer_id'),
   customerName: text('customer_name').notNull(),
@@ -136,19 +145,24 @@ export const invoices = pgTable('invoices', {
   eInvoiceError: text('e_invoice_error'),
   taxRate: doublePrecision('tax_rate'),
   taxAmount: doublePrecision('tax_amount'),
-});
+}, (table) => [
+  primaryKey({ columns: [table.id, table.trialId] })
+]);
 
 // 7. Staff table
 export const staffTable = pgTable('staff', {
-  id: text('id').primaryKey().notNull(),
-  trialId: text('trial_id'),
+  id: text('id').notNull(),
+  trialId: text('trial_id').notNull(),
   name: text('name').notNull(),
   email: text('email').notNull(),
   role: text('role').notNull(),
   phone: text('phone').notNull(),
   active: boolean('active').notNull(),
+  password: text('password'),
   permissions: jsonb('permissions'),
-});
+}, (table) => [
+  primaryKey({ columns: [table.id, table.trialId] })
+]);
 
 // 8. Settings table
 export const settingsTable = pgTable('settings', {
@@ -178,20 +192,22 @@ export const settingsTable = pgTable('settings', {
 
 // 9. Audits table
 export const auditsTable = pgTable('audits', {
-  id: text('id').primaryKey().notNull(),
-  trialId: text('trial_id'),
+  id: text('id').notNull(),
+  trialId: text('trial_id').notNull(),
   auditCode: text('audit_code').notNull(),
   date: text('date').notNull(),
   auditorName: text('auditor_name').notNull(),
   items: jsonb('items').notNull(), // InventoryAuditItem[]
   status: text('status').notNull(),
   notes: text('notes'),
-});
+}, (table) => [
+  primaryKey({ columns: [table.id, table.trialId] })
+]);
 
 // 10. Purchase Orders table
 export const purchaseOrders = pgTable('purchase_orders', {
-  id: text('id').primaryKey().notNull(),
-  trialId: text('trial_id'),
+  id: text('id').notNull(),
+  trialId: text('trial_id').notNull(),
   orderCode: text('order_code').notNull(),
   date: text('date').notNull(),
   supplierId: text('supplier_id').notNull(),
@@ -201,12 +217,14 @@ export const purchaseOrders = pgTable('purchase_orders', {
   amountPaid: doublePrecision('amount_paid').notNull(),
   amountOwed: doublePrecision('amount_owed').notNull(),
   status: text('status').notNull(),
-});
+}, (table) => [
+  primaryKey({ columns: [table.id, table.trialId] })
+]);
 
 // 11. Cashbook table
 export const cashbookTable = pgTable('cashbook', {
-  id: text('id').primaryKey().notNull(),
-  trialId: text('trial_id'),
+  id: text('id').notNull(),
+  trialId: text('trial_id').notNull(),
   entryCode: text('entry_code').notNull(),
   type: text('type').notNull(),
   amount: doublePrecision('amount').notNull(),
@@ -215,12 +233,14 @@ export const cashbookTable = pgTable('cashbook', {
   paymentMethod: text('payment_method').notNull(),
   date: text('date').notNull(),
   creatorName: text('creator_name').notNull(),
-});
+}, (table) => [
+  primaryKey({ columns: [table.id, table.trialId] })
+]);
 
 // 12. Projects table
 export const projectsTable = pgTable('projects', {
-  id: text('id').primaryKey().notNull(),
-  trialId: text('trial_id'),
+  id: text('id').notNull(),
+  trialId: text('trial_id').notNull(),
   name: text('name').notNull(),
   address: text('address').notNull(),
   customerName: text('customer_name').notNull(),
@@ -233,12 +253,14 @@ export const projectsTable = pgTable('projects', {
   budget: doublePrecision('budget').notNull(),
   expenses: doublePrecision('expenses').notNull(),
   notes: text('notes'),
-});
+}, (table) => [
+  primaryKey({ columns: [table.id, table.trialId] })
+]);
 
 // 13. Cash shifts table
 export const cashShiftsTable = pgTable('cash_shifts', {
-  id: text('id').primaryKey().notNull(),
-  trialId: text('trial_id'),
+  id: text('id').notNull(),
+  trialId: text('trial_id').notNull(),
   code: text('code').notNull(),
   startTime: text('start_time').notNull(),
   endTime: text('end_time'),
@@ -251,17 +273,21 @@ export const cashShiftsTable = pgTable('cash_shifts', {
   actualBank: doublePrecision('actual_bank'),
   notes: text('notes'),
   status: text('status').notNull(),
-});
+}, (table) => [
+  primaryKey({ columns: [table.id, table.trialId] })
+]);
 
 // 14. System Logs table
 export const systemLogsTable = pgTable('system_logs', {
-  id: text('id').primaryKey().notNull(),
-  trialId: text('trial_id'),
+  id: text('id').notNull(),
+  trialId: text('trial_id').notNull(),
   actionType: text('action_type').notNull(),
   actionName: text('action_name').notNull(),
   description: text('description').notNull(),
   actorName: text('actor_name').notNull(),
   actorRole: text('actor_role').notNull(),
   timestamp: text('timestamp').notNull(),
-});
+}, (table) => [
+  primaryKey({ columns: [table.id, table.trialId] })
+]);
 

@@ -5,12 +5,11 @@ import {
   Building, Phone, Mail, MapPin, FileText, CheckCircle2, Star, ArrowLeft,
   Building2, Activity, Laptop, DollarSign, Check, PhoneCall
 } from "lucide-react";
-import { Staff } from "../types";
+import { Staff, COUNTRY_CODES } from "../types";
 import { doc } from "firebase/firestore";
 import { db, safeSetDoc } from "../lib/firebase";
 
 interface KiotLoginProps {
-  staffList: Staff[];
   onSelectStaff: (staff: Staff) => void;
   onGoogleLogin: () => Promise<void>;
   isSyncing: boolean;
@@ -18,7 +17,6 @@ interface KiotLoginProps {
 }
 
 export default function KiotLogin({
-  staffList,
   onSelectStaff,
   onGoogleLogin,
   isSyncing,
@@ -27,17 +25,143 @@ export default function KiotLogin({
   
   // viewMode is "landing" by default to welcome external guests just like Sapo & KiotViet
   const [viewMode, setViewMode] = useState<"landing" | "login">("landing");
-  const [activeTab, setActiveTab] = useState<"quick" | "credential" | "google">("credential");
+  const [activeTab, setActiveTab] = useState<"credential" | "google">("credential");
 
   // Trial registration states
   const [trialShopName, setTrialShopName] = useState("");
   const [trialOwnerName, setTrialOwnerName] = useState("");
+  const [trialPhoneRegion, setTrialPhoneRegion] = useState("");
   const [trialPhone, setTrialPhone] = useState("");
   const [trialEmail, setTrialEmail] = useState("");
   const [trialPassword, setTrialPassword] = useState("");
   const [trialAddress, setTrialAddress] = useState("");
   const [trialNotes, setTrialNotes] = useState("");
   const [isSubmittingTrial, setIsSubmittingTrial] = useState(false);
+  const [registrationError, setRegistrationError] = useState<string | null>(null);
+
+  // Real-time validation and duplicate warnings
+  const [emailWarning, setEmailWarning] = useState<string | null>(null);
+  const [phoneWarning, setPhoneWarning] = useState<string | null>(null);
+  const [isCheckingEmail, setIsCheckingEmail] = useState(false);
+  const [isCheckingPhone, setIsCheckingPhone] = useState(false);
+
+  // Real-time email validation effect
+  React.useEffect(() => {
+    const email = trialEmail.trim().toLowerCase();
+    if (!email) {
+      setEmailWarning(null);
+      return;
+    }
+
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      setEmailWarning("⚠️ Định dạng Email không hợp lệ (Ví dụ: ten@gmail.com).");
+      return;
+    }
+
+    if (email === "congbaotruong8@gmail.com") {
+      setEmailWarning("⚠️ Email 'congbaotruong8@gmail.com' là tài khoản quản trị viên / chủ hệ thống KiotX! Không thể đăng ký dùng thử.");
+      return;
+    }
+
+    const timer = setTimeout(async () => {
+      setIsCheckingEmail(true);
+      try {
+        const { collection, getDocs, query, where } = await import("firebase/firestore");
+        const trialsRef = collection(db, "kiot_trials");
+        const q = query(trialsRef, where("email", "==", email));
+        const snapshot = await getDocs(q);
+        if (!snapshot.empty) {
+          setEmailWarning(`⚠️ Email/Gmail "${trialEmail}" này đã được đăng ký dùng thử trước đó! Vui lòng sử dụng email khác.`);
+        } else {
+          setEmailWarning(null);
+        }
+      } catch (err) {
+        console.warn("Lỗi kiểm tra trùng email:", err);
+      } finally {
+        setIsCheckingEmail(false);
+      }
+    }, 600);
+
+    return () => clearTimeout(timer);
+  }, [trialEmail]);
+
+  // Real-time phone validation effect
+  React.useEffect(() => {
+    const phone = trialPhone.trim();
+    if (!phone) {
+      setPhoneWarning(null);
+      return;
+    }
+
+    const cleanPhone = phone.replace(/\D/g, "");
+
+    const config = COUNTRY_CODES.find(c => c.code === trialPhoneRegion);
+    if (config) {
+      const { lengths, name, dialCode } = config;
+      const minLen = Math.min(...lengths);
+      const maxLen = Math.max(...lengths);
+      
+      if (cleanPhone.length > 0) {
+        if (lengths.length === 1) {
+          const expected = lengths[0];
+          if (cleanPhone.length !== expected) {
+            const diff = cleanPhone.length - expected;
+            setPhoneWarning(`⚠️ SĐT ${name} (${dialCode}) bắt buộc phải có đúng ${expected} chữ số (Bạn nhập ${cleanPhone.length} số, đang ${diff > 0 ? `dư ${diff}` : `thiếu ${Math.abs(diff)}`} số).`);
+            return;
+          }
+        } else {
+          if (cleanPhone.length < minLen || cleanPhone.length > maxLen) {
+            setPhoneWarning(`⚠️ SĐT ${name} (${dialCode}) phải có từ ${minLen} đến ${maxLen} chữ số (Bạn nhập ${cleanPhone.length} số).`);
+            return;
+          }
+        }
+      }
+
+      if (trialPhoneRegion === "VN" && phone.length > 0 && !phone.startsWith("0")) {
+        setPhoneWarning("⚠️ SĐT Việt Nam (+84) phải bắt đầu bằng chữ số 0 (Ví dụ: 0901234567).");
+        return;
+      }
+    }
+
+    const timer = setTimeout(async () => {
+      setIsCheckingPhone(true);
+      try {
+        const { collection, getDocs, query, where } = await import("firebase/firestore");
+        const trialsRef = collection(db, "kiot_trials");
+        
+        // Exact phone check
+        const qPhone = query(trialsRef, where("phone", "==", phone));
+        const phoneSnapshot = await getDocs(qPhone);
+        let exists = !phoneSnapshot.empty;
+
+        if (!exists) {
+          // Check clean digits match across all trials
+          const allTrialsSnapshot = await getDocs(trialsRef);
+          for (const doc of allTrialsSnapshot.docs) {
+            const data = doc.data();
+            const dPhone = (data.phone || "").replace(/\D/g, "");
+            if (dPhone === cleanPhone && cleanPhone.length > 0) {
+              exists = true;
+              break;
+            }
+          }
+        }
+
+        if (exists) {
+          setPhoneWarning(`⚠️ Số điện thoại "${phone}" này đã được đăng ký dùng thử trước đó! Vui lòng chọn số khác.`);
+        } else {
+          setPhoneWarning(null);
+        }
+      } catch (err) {
+        console.warn("Lỗi kiểm tra trùng SĐT:", err);
+      } finally {
+        setIsCheckingPhone(false);
+      }
+    }, 600);
+
+    return () => clearTimeout(timer);
+  }, [trialPhone, trialPhoneRegion]);
 
   // Credential login states
   const [loginEmail, setLoginEmail] = useState("");
@@ -60,13 +184,122 @@ export default function KiotLogin({
 
   const handleRegisterTrial = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!trialShopName || !trialOwnerName || !trialPhone || !trialEmail || !trialPassword) {
-      alert("Vui lòng nhập đầy đủ các trường thông tin bắt buộc!");
+    setRegistrationError(null);
+
+    if (emailWarning) {
+      setRegistrationError(emailWarning);
+      alert(emailWarning);
       return;
+    }
+    if (phoneWarning) {
+      setRegistrationError(phoneWarning);
+      alert(phoneWarning);
+      return;
+    }
+
+    if (!trialShopName || !trialOwnerName || !trialPhone || !trialEmail || !trialPassword) {
+      const errMsg = "Vui lòng nhập đầy đủ các trường thông tin bắt buộc!";
+      setRegistrationError(errMsg);
+      alert(errMsg);
+      return;
+    }
+
+    // 1. Check if Phone Region is selected
+    if (!trialPhoneRegion) {
+      const errMsg = "Lỗi: Bạn chưa chọn Khu vực/Quốc gia cho số điện thoại! Vui lòng chọn khu vực thích hợp (Ví dụ: Việt Nam (+84)).";
+      setRegistrationError(errMsg);
+      alert(errMsg);
+      return;
+    }
+
+    // 2. Validate phone number based on selected region
+    const cleanPhone = trialPhone.replace(/\D/g, ""); // extract only digits
+    const config = COUNTRY_CODES.find(c => c.code === trialPhoneRegion);
+    if (config) {
+      const { lengths, name, dialCode } = config;
+      const minLen = Math.min(...lengths);
+      const maxLen = Math.max(...lengths);
+      
+      if (lengths.length === 1) {
+        const expected = lengths[0];
+        if (cleanPhone.length !== expected) {
+          const diff = cleanPhone.length - expected;
+          const errMsg = `Lỗi định dạng SĐT: Số điện thoại ${name} (${dialCode}) bắt buộc phải có đúng ${expected} chữ số! Bạn đang nhập ${cleanPhone.length} số (bị ${diff > 0 ? `thừa/dư ${diff}` : `thiếu ${Math.abs(diff)}`} chữ số). Vui lòng nhập chính xác ${expected} chữ số.`;
+          setRegistrationError(errMsg);
+          alert(errMsg);
+          return;
+        }
+      } else {
+        if (cleanPhone.length < minLen || cleanPhone.length > maxLen) {
+          const errMsg = `Lỗi định dạng SĐT: Số điện thoại ${name} (${dialCode}) phải có từ ${minLen} đến ${maxLen} chữ số! Bạn đang nhập ${cleanPhone.length} số.`;
+          setRegistrationError(errMsg);
+          alert(errMsg);
+          return;
+        }
+      }
+
+      if (trialPhoneRegion === "VN" && !trialPhone.trim().startsWith("0")) {
+        const errMsg = "Lỗi định dạng SĐT: Số điện thoại Việt Nam (+84) phải bắt đầu bằng chữ số 0 (Ví dụ: 0901234567).";
+        setRegistrationError(errMsg);
+        alert(errMsg);
+        return;
+      }
     }
 
     setIsSubmittingTrial(true);
     try {
+      const { collection, getDocs, query, where } = await import("firebase/firestore");
+      const cleanEmail = trialEmail.trim().toLowerCase();
+
+      // Explicitly block the system admin / master owner email from being registered as a trial
+      if (cleanEmail === "congbaotruong8@gmail.com") {
+        const errMsg = `Lỗi đăng ký: Email "congbaotruong8@gmail.com" là tài khoản quản trị viên / chủ hệ thống KiotX! Bạn không thể dùng email này để đăng ký tài khoản dùng thử mới.`;
+        setRegistrationError(errMsg);
+        alert(errMsg);
+        setIsSubmittingTrial(false);
+        return;
+      }
+
+      const trialsRef = collection(db, "kiot_trials");
+
+      // Check if phone already registered in database (both exact and clean digits matching)
+      const qPhone = query(trialsRef, where("phone", "==", trialPhone.trim()));
+      const phoneSnapshot = await getDocs(qPhone);
+      let phoneExists = !phoneSnapshot.empty;
+
+      if (!phoneExists) {
+        // Also check if any existing trial has the same clean phone digits
+        const allTrialsSnapshot = await getDocs(trialsRef);
+        for (const doc of allTrialsSnapshot.docs) {
+          const data = doc.data();
+          const dPhone = (data.phone || "").replace(/\D/g, "");
+          if (dPhone === cleanPhone && cleanPhone.length > 0) {
+            phoneExists = true;
+            break;
+          }
+        }
+      }
+
+      if (phoneExists) {
+        const errMsg = `Lỗi đăng ký: Số điện thoại "${trialPhone}" này đã được đăng ký sử dụng dùng thử trước đó trên hệ thống! Vui lòng sử dụng số điện thoại khác hoặc liên hệ Trương Công Bảo để được hỗ trợ giải phóng số điện thoại này.`;
+        setRegistrationError(errMsg);
+        alert(errMsg);
+        setIsSubmittingTrial(false);
+        return;
+      }
+
+      // Check if email already registered
+      const q = query(trialsRef, where("email", "==", cleanEmail));
+      const querySnapshot = await getDocs(q);
+
+      if (!querySnapshot.empty) {
+        const errMsg = `Lỗi đăng ký: Địa chỉ Gmail/Email "${trialEmail}" này đã được đăng ký sử dụng dùng thử trước đó trên hệ thống! Vui lòng sử dụng địa chỉ Gmail khác hoặc liên hệ Trương Công Bảo để được hỗ trợ giải phóng email này.`;
+        setRegistrationError(errMsg);
+        alert(errMsg);
+        setIsSubmittingTrial(false);
+        return;
+      }
+
       const trialId = `trial-${Date.now()}`;
       const createdAt = new Date().toISOString();
       const expireDate = new Date(Date.now() + 20 * 24 * 60 * 60 * 1000).toISOString();
@@ -396,6 +629,16 @@ export default function KiotLogin({
                 </div>
 
                 <form onSubmit={handleRegisterTrial} className="space-y-4 relative z-10">
+                  {registrationError && (
+                    <div className="p-3.5 rounded-xl bg-red-500/10 border border-red-500/35 text-red-200 text-xs flex gap-2.5 items-start leading-relaxed animate-pulse">
+                      <ShieldAlert className="h-4.5 w-4.5 text-red-400 shrink-0 mt-0.5" />
+                      <div className="space-y-0.5">
+                        <span className="font-bold text-red-400 block uppercase tracking-wider text-[10px]">Cảnh báo lỗi đăng ký</span>
+                        <span>{registrationError}</span>
+                      </div>
+                    </div>
+                  )}
+
                   {/* Tên cửa hàng */}
                   <div className="space-y-1">
                     <label className="text-[10px] text-stone-400 font-bold uppercase tracking-wider block">Tên cửa hàng / Nhà hàng *</label>
@@ -430,18 +673,66 @@ export default function KiotLogin({
 
                   {/* Số điện thoại */}
                   <div className="space-y-1">
-                    <label className="text-[10px] text-stone-400 font-bold uppercase tracking-wider block">Số điện thoại *</label>
-                    <div className="relative">
-                      <Phone className="absolute left-3 top-3 h-4 w-4 text-stone-500" />
-                      <input
-                        type="tel"
-                        required
-                        placeholder="Ví dụ: 0901234567"
-                        value={trialPhone}
-                        onChange={e => setTrialPhone(e.target.value)}
-                        className="w-full pl-9 pr-3 py-2.5 bg-stone-950 border border-stone-850 rounded-xl text-xs text-stone-200 placeholder-stone-600 focus:outline-none focus:border-emerald-500 transition-colors font-mono"
-                      />
+                    <label className="text-[10px] text-stone-400 font-bold uppercase tracking-wider block">Số điện thoại & Khu vực *</label>
+                    <div className="flex gap-2">
+                      <div className="w-[110px] shrink-0">
+                        <select
+                          required
+                          value={trialPhoneRegion}
+                          onChange={e => {
+                            setTrialPhoneRegion(e.target.value);
+                            setRegistrationError(null);
+                          }}
+                          className={`w-full px-2 py-2.5 bg-stone-950 border rounded-xl text-xs text-stone-200 focus:outline-none focus:border-emerald-500 transition-colors cursor-pointer h-[42px] font-semibold ${
+                            !trialPhoneRegion ? "border-amber-500/50 text-amber-400 bg-amber-500/5" : "border-stone-850"
+                          }`}
+                        >
+                          <option value="">-- Quốc gia --</option>
+                          {COUNTRY_CODES.map(c => (
+                            <option key={c.code} value={c.code}>
+                              {c.flag} {c.code} ({c.dialCode})
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                      <div className="flex-1 relative">
+                        <Phone className="absolute left-3 top-3 h-4 w-4 text-stone-500" />
+                        <input
+                          type="tel"
+                          required
+                          placeholder={
+                            (() => {
+                              const config = COUNTRY_CODES.find(c => c.code === trialPhoneRegion);
+                              return config ? `${config.name}: ${config.placeholder}` : "Nhập số điện thoại";
+                            })()
+                          }
+                          value={trialPhone}
+                          onChange={e => {
+                            setTrialPhone(e.target.value);
+                            setRegistrationError(null);
+                          }}
+                          className={`w-full pl-9 pr-3 py-2.5 bg-stone-950 border rounded-xl text-xs text-stone-200 placeholder-stone-600 focus:outline-none focus:border-emerald-500 transition-colors font-mono h-[42px] ${
+                            phoneWarning ? "border-rose-500/80 text-rose-200 bg-rose-500/5" : (registrationError && registrationError.includes("SĐT") ? "border-red-500/50" : "border-stone-850")
+                          }`}
+                        />
+                      </div>
                     </div>
+                    {phoneWarning && (
+                      <span className="text-[11px] text-rose-400 font-medium block leading-normal mt-1 animate-pulse">
+                        {phoneWarning}
+                      </span>
+                    )}
+                    {isCheckingPhone && (
+                      <span className="text-[10px] text-stone-500 font-semibold block leading-normal mt-1 flex items-center gap-1.5">
+                        <span className="h-3 w-3 border-2 border-stone-500 border-t-transparent rounded-full animate-spin" />
+                        Đang kiểm tra số điện thoại trên hệ thống...
+                      </span>
+                    )}
+                    {!trialPhoneRegion && (
+                      <span className="text-[9px] text-amber-500 font-semibold block leading-normal mt-0.5">
+                        ⚠ Vui lòng chọn Khu vực thích hợp trước khi nhập số điện thoại
+                      </span>
+                    )}
                   </div>
 
                   {/* Email */}
@@ -454,10 +745,26 @@ export default function KiotLogin({
                         required
                         placeholder="Ví dụ: email@gmail.com"
                         value={trialEmail}
-                        onChange={e => setTrialEmail(e.target.value)}
-                        className="w-full pl-9 pr-3 py-2.5 bg-stone-950 border border-stone-850 rounded-xl text-xs text-stone-200 placeholder-stone-600 focus:outline-none focus:border-emerald-500 transition-colors font-mono"
+                        onChange={e => {
+                          setTrialEmail(e.target.value);
+                          setRegistrationError(null);
+                        }}
+                        className={`w-full pl-9 pr-3 py-2.5 bg-stone-950 border rounded-xl text-xs text-stone-200 placeholder-stone-600 focus:outline-none focus:border-emerald-500 transition-colors font-mono ${
+                          emailWarning ? "border-rose-500/80 text-rose-200 bg-rose-500/5" : (registrationError && registrationError.includes("Gmail") ? "border-red-500/50" : "border-stone-850")
+                        }`}
                       />
                     </div>
+                    {emailWarning && (
+                      <span className="text-[11px] text-rose-400 font-medium block leading-normal mt-1 animate-pulse">
+                        {emailWarning}
+                      </span>
+                    )}
+                    {isCheckingEmail && (
+                      <span className="text-[10px] text-stone-500 font-semibold block leading-normal mt-1 flex items-center gap-1.5">
+                        <span className="h-3 w-3 border-2 border-stone-500 border-t-transparent rounded-full animate-spin" />
+                        Đang kiểm tra email trên hệ thống...
+                      </span>
+                    )}
                   </div>
 
                   {/* Mật khẩu đăng nhập */}
@@ -879,22 +1186,6 @@ export default function KiotLogin({
                         <div className="absolute bottom-[-13px] inset-x-0 h-0.5 bg-emerald-500" />
                       )}
                     </button>
-
-                    <button
-                      type="button"
-                      onClick={() => setActiveTab("quick")}
-                      className={`pb-1 text-xs font-black uppercase tracking-wider relative cursor-pointer shrink-0 ${
-                        activeTab === "quick" ? "text-emerald-400" : "text-stone-500 hover:text-stone-400"
-                      }`}
-                    >
-                      <span className="flex items-center gap-1">
-                        <Users className="h-4 w-4" />
-                        <span>Demo nhanh (3s)</span>
-                      </span>
-                      {activeTab === "quick" && (
-                        <div className="absolute bottom-[-13px] inset-x-0 h-0.5 bg-emerald-500" />
-                      )}
-                    </button>
                   </div>
 
                   {/* Render Tabs */}
@@ -924,7 +1215,7 @@ export default function KiotLogin({
                           <label className="text-[10px] text-stone-400 font-bold uppercase tracking-wider block">Mật khẩu đăng nhập</label>
                           <button
                             type="button"
-                            onClick={() => alert("Mẹo thử nghiệm: Nếu quên mật khẩu, bạn có thể tạo tài khoản dùng thử mới chỉ trong 3 giây ở Trang chủ, hoặc đăng nhập tab Demo nhanh để trải nghiệm ngay lập tức.")}
+                            onClick={() => alert("Mẹo thử nghiệm: Nếu quên mật khẩu, bạn có thể tạo tài khoản dùng thử mới chỉ trong 3 giây ở Trang chủ bằng nút Đăng ký dùng thử.")}
                             className="text-[10px] text-emerald-400 hover:underline cursor-pointer"
                           >
                             Quên mật khẩu?
@@ -961,55 +1252,13 @@ export default function KiotLogin({
                         )}
                       </button>
                     </form>
-                  ) : activeTab === "quick" ? (
-                    <div className="space-y-4">
-                      <div className="text-xs text-stone-400 mb-2 leading-relaxed">
-                        Để bạn tiện kiểm thử và trải nghiệm sự khác biệt về quyền hạn, vui lòng click chọn trực tiếp một trong các vai trò đại diện dưới đây:
-                      </div>
-
-                      <div className="space-y-3 max-h-[340px] overflow-y-auto pr-1 scrollbar-thin">
-                        {staffList.filter(s => s.active).map(staff => (
-                          <button
-                            key={staff.id}
-                            type="button"
-                            onClick={() => onSelectStaff(staff)}
-                            className="w-full p-4 rounded-2xl bg-stone-950 hover:bg-stone-850/80 border border-stone-850 hover:border-emerald-500/30 text-left transition-all group flex items-center justify-between cursor-pointer relative"
-                          >
-                            <div className="flex items-center gap-3.5">
-                              {/* Avatar Placeholder */}
-                              <div className="h-10 w-10 rounded-xl bg-stone-900 border border-stone-800 flex items-center justify-center font-black text-stone-300 uppercase font-sans group-hover:border-emerald-500/20 group-hover:bg-stone-950 transition-all">
-                                {staff.name.charAt(0)}
-                              </div>
-                              <div className="space-y-1">
-                                <div className="flex items-center gap-2">
-                                  <span className="text-xs font-black text-stone-200 group-hover:text-stone-100 transition-colors">
-                                    {staff.name}
-                                  </span>
-                                  <span className={`px-1.5 py-0.5 rounded border text-[9px] font-mono font-bold leading-none ${getRoleBadgeColor(staff.role)}`}>
-                                    {getRoleLabel(staff.role).split(" ")[0]}
-                                  </span>
-                                </div>
-                                <span className="text-[10px] text-stone-500 block leading-none font-mono">
-                                  {staff.email}
-                                </span>
-                              </div>
-                            </div>
-
-                            {/* Right action indicator */}
-                            <div className="h-8 w-8 rounded-lg bg-stone-900 border border-stone-850 flex items-center justify-center text-stone-500 group-hover:text-emerald-400 group-hover:border-emerald-500/20 transition-all">
-                              <Play className="h-3.5 w-3.5 fill-current" />
-                            </div>
-                          </button>
-                        ))}
-                      </div>
-                    </div>
                   ) : (
-                    <div className="space-y-6 py-6 text-center">
+                    <div className="space-y-5 py-4 text-center">
                       <div className="text-xs text-stone-400 leading-relaxed max-w-sm mx-auto">
                         Đăng nhập an toàn bằng tài khoản Google cá nhân của bạn. Hệ thống sẽ tự động liên kết với thông tin nhân sự trên đám mây của cửa hàng.
                       </div>
 
-                      <div className="flex justify-center pt-2">
+                      <div className="flex justify-center pt-1">
                         <button
                           type="button"
                           onClick={onGoogleLogin}
@@ -1029,7 +1278,25 @@ export default function KiotLogin({
                         </button>
                       </div>
 
-                      <div className="text-[10px] text-stone-500 font-mono mt-2">
+                      <div className="p-3 bg-stone-950/80 border border-stone-850 rounded-xl max-w-sm mx-auto text-[11px] text-stone-400 space-y-1 text-left">
+                        <div className="text-stone-300 font-bold flex items-center gap-1.5">
+                          <span>💡 Lưu ý về Pop-up trình duyệt:</span>
+                        </div>
+                        <p className="text-[10px] text-stone-400 leading-normal">
+                          Nếu trình duyệt chặn cửa sổ bật lên, hãy chọn <strong>"Luôn cho phép Pop-up"</strong> trên thanh địa chỉ, hoặc chọn tab <strong>"Tài khoản mẫu"</strong> để đăng nhập ngay mà không cần tài khoản Google.
+                        </p>
+                        <div className="pt-1 flex gap-2">
+                          <button
+                            type="button"
+                            onClick={() => setActiveTab("credential")}
+                            className="text-[10px] text-emerald-400 hover:underline font-bold cursor-pointer"
+                          >
+                            → Chuyển sang Đăng nhập Mật khẩu / SĐT
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="text-[10px] text-stone-500 font-mono">
                         Xác thực an toàn qua Google Firebase Auth
                       </div>
                     </div>

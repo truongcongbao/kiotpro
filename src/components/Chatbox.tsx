@@ -43,7 +43,7 @@ export default function Chatbox({
     "Sản phẩm nào bán chạy nhất?",
     "Làm sao cải thiện lợi nhuận?",
     "Các mặt hàng nào cần nhập kho?",
-    "Báo cáo sơ bộ doanh thu & dự án?"
+    "Báo cáo sơ bộ doanh thu & sổ quỹ?"
   ];
 
   // Auto-scroll on new messages
@@ -59,7 +59,7 @@ export default function Chatbox({
           msg.id === "welcome"
             ? {
                 ...msg,
-                text: `Xin chào! Tôi là KiotX AI Co-Pilot — Trợ lý phân tích & vận hành cửa hàng thông minh của ${settings.shopName || "Trương Gia Phát"}.\n\nTôi sẵn sàng hỗ trợ phân tích báo cáo bán hàng, rà soát sổ quỹ, cảnh báo tồn kho tối thiểu, hoặc cập nhật nhanh tiến độ các công trình/dự án của bạn. Bạn cần tôi hỗ trợ phân tích nội dung nào hôm nay?`
+                text: `Xin chào! Tôi là KiotX AI Co-Pilot — Trợ lý phân tích & vận hành cửa hàng thông minh của ${settings.shopName || "KiotX Store"}.\n\nTôi sẵn sàng hỗ trợ phân tích báo cáo bán hàng, rà soát sổ quỹ hoặc cảnh báo tồn kho tối thiểu của bạn. Bạn cần tôi hỗ trợ phân tích nội dung nào hôm nay?`
               }
             : msg
         )
@@ -76,7 +76,7 @@ export default function Chatbox({
   }, [isOpen, externalPrompt]);
 
   const generateStoreContext = (): string => {
-    const shopName = settings?.shopName || "Trương Gia Phát";
+    const shopName = settings?.shopName || "KiotX Store";
     const address = settings?.address || "Chưa thiết lập";
     const phone = settings?.phone || "Chưa thiết lập";
     

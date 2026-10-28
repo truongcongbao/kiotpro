@@ -1,9 +1,113 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // Allow full read, write, create, update, and delete access to all collections
+
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() && request.auth.token.email == 'congbaotruong8@gmail.com';
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128;
+    }
+
+    // 1. kiot_trials: SaaS Trial Registrations
+    match /kiot_trials/{trialId} {
+      allow read: if true; // Required for trial credentials lookup and verification
+      // Public creation requires valid trial registration structure
+      allow create: if isValidId(trialId) &&
+        request.resource.data.shopName is string &&
+        request.resource.data.ownerName is string &&
+        request.resource.data.phone is string &&
+        request.resource.data.email is string;
+      // Updates allowed by admin or valid tenant update
+      allow update: if isAdmin() || (
+        isValidId(trialId) &&
+        request.resource.data.shopName is string &&
+        request.resource.data.ownerName is string
+      );
+      // Destructive deletion strictly protected: only admin or authenticated account
+      allow delete: if isAdmin() || isAuthenticated();
+    }
+
+    // 2. kiot_invoices: Sales & Transaction Records
+    match /kiot_invoices/{invoiceId} {
+      allow read: if true;
+      allow create, update: if isValidId(invoiceId) &&
+        request.resource.data.invoiceCode is string &&
+        request.resource.data.totalPayable is number;
+      allow delete: if isAdmin() || isAuthenticated();
+    }
+
+    // 3. kiot_products: Product Inventory
+    match /kiot_products/{productId} {
+      allow read: if true;
+      allow create, update: if isValidId(productId) &&
+        request.resource.data.name is string &&
+        request.resource.data.sellingPrice is number;
+      allow delete: if isAdmin() || isAuthenticated();
+    }
+
+    // 4. kiot_customers: Customers & Loyalty
+    match /kiot_customers/{customerId} {
+      allow read: if true;
+      allow create, update: if isValidId(customerId) &&
+        request.resource.data.name is string;
+      allow delete: if isAdmin() || isAuthenticated();
+    }
+
+    // 5. kiot_suppliers: Supplier Contacts
+    match /kiot_suppliers/{supplierId} {
+      allow read: if true;
+      allow write: if isValidId(supplierId);
+    }
+
+    // 6. kiot_categories: Product Categories
+    match /kiot_categories/{categoryId} {
+      allow read: if true;
+      allow write: if isValidId(categoryId);
+    }
+
+    // 7. kiot_settings: Store Configuration
+    match /kiot_settings/{settingId} {
+      allow read: if true;
+      allow write: if isValidId(settingId);
+    }
+
+    // 8. kiot_audits: Inventory Stocktaking
+    match /kiot_audits/{auditId} {
+      allow read: if true;
+      allow write: if isValidId(auditId);
+    }
+
+    // 9. kiot_cashbook: Financial Cash Flow Records
+    match /kiot_cashbook/{cashbookId} {
+      allow read: if true;
+      allow write: if isValidId(cashbookId);
+    }
+
+    // 10. kiot_system_logs: Audit Trails & Activity Logs
+    match /kiot_system_logs/{logId} {
+      allow read: if true;
+      allow create: if isValidId(logId) && request.resource.data.action is string;
+      allow update, delete: if isAdmin();
+    }
+
+    // 11. kiot_staff: Employees & Roles
+    match /kiot_staff/{staffId} {
+      allow read: if true;
+      allow create, update: if isValidId(staffId) && request.resource.data.name is string;
+      allow delete: if isAdmin() || isAuthenticated();
+    }
+
+    // Default deny all other unspecified collections
     match /{document=**} {
-      allow read, write, delete: if true;
+      allow read, write: if false;
     }
   }
 }
+

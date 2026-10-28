@@ -1,7 +1,7 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { 
-  Product, Category, Customer, Supplier, Invoice, Staff, ShopSetting, InventoryAudit, PurchaseOrder, CashbookEntry, Project, CashShift, SystemAuditLog, TrialRegistration 
+  Product, Category, Customer, Supplier, Invoice, Staff, ShopSetting, InventoryAudit, PurchaseOrder, CashbookEntry, Project, CashShift, SystemAuditLog, TrialRegistration, StoreFeatureFlags, isModuleEnabled 
 } from "./types";
 import { 
   DEFAULT_PRODUCTS, DEFAULT_CATEGORIES, DEFAULT_CUSTOMERS, 
@@ -21,7 +21,6 @@ import KiotSettings from "./components/KiotSettings";
 import KiotLogin from "./components/KiotLogin";
 import KiotRestrictedView from "./components/KiotRestrictedView";
 import KiotCashbook from "./components/KiotCashbook";
-import KiotProjects from "./components/KiotProjects";
 import KiotTrialsManager from "./components/KiotTrialsManager";
 import TrialExtensionModal from "./components/TrialExtensionModal";
 import Chatbox from "./components/Chatbox";
@@ -79,6 +78,10 @@ export default function App() {
     });
   };
 
+  const handleTabChange = (tabId: string) => {
+    setActiveTab(tabId);
+  };
+
   // Keep track of deleted trial IDs to prevent synchronization feedback loops
   const deletedTrialIdsRef = useRef<Set<string>>(new Set());
 
@@ -106,13 +109,23 @@ export default function App() {
     const saved = localStorage.getItem("kiot_is_online");
     return saved !== null ? saved === "true" : (typeof window !== "undefined" ? window.navigator.onLine : true);
   });
+  const [isRealOnline, setIsRealOnline] = useState<boolean>(() => {
+    return typeof window !== "undefined" ? window.navigator.onLine : true;
+  });
+  const [isManualOffline, setIsManualOffline] = useState<boolean>(() => {
+    return localStorage.getItem("kiot_manual_offline") === "true";
+  });
   const [offlineQueue, setOfflineQueue] = useState<Invoice[]>(() => {
     return safeGetLocalStorage<Invoice[]>("kiot_offline_queue", []);
   });
   const [isSyncing, setIsSyncing] = useState(false);
+  const isSyncingRef = useRef(isSyncing);
+  isSyncingRef.current = isSyncing;
 
   // Background cloud database connection check state
   const [isSyncingAll, setIsSyncingAll] = useState(false);
+  const isSyncingAllRef = useRef(isSyncingAll);
+  isSyncingAllRef.current = isSyncingAll;
   const [lastSyncTime, setLastSyncTime] = useState<string>(() => {
     return localStorage.getItem("kiot_last_sync_time") || "";
   });
@@ -125,6 +138,110 @@ export default function App() {
     setAutoSyncEnabled(enabled);
     localStorage.setItem("kiot_auto_sync_enabled", String(enabled));
   };
+
+  // Checksum / Integrity validation state
+  const [integrityStatus, setIntegrityStatus] = useState<{
+    lastChecked: string;
+    hasDiscrepancy: boolean;
+    discrepancyCount: number;
+    details: string[];
+  }>(() => {
+    return {
+      lastChecked: localStorage.getItem("kiot_last_integrity_check") || "",
+      hasDiscrepancy: false,
+      discrepancyCount: 0,
+      details: []
+    };
+  });
+
+  const runChecksumValidation = useCallback((silent = true) => {
+    try {
+      const offlineRaw = localStorage.getItem("kiot_offline_queue");
+      const offlineInvs: Invoice[] = offlineRaw ? JSON.parse(offlineRaw) : [];
+
+      const serverInvsRaw = localStorage.getItem("kiot_server_invoices");
+      const serverInvs: Invoice[] = serverInvsRaw ? JSON.parse(serverInvsRaw) : [];
+      
+      const serverMap = new Map<string, Invoice>();
+      serverInvs.forEach(inv => {
+        if (inv.invoiceCode) {
+          serverMap.set(inv.invoiceCode, inv);
+        }
+        serverMap.set(inv.id, inv);
+      });
+
+      const discrepancies: string[] = [];
+
+      for (const offlineInv of offlineInvs) {
+        const match = serverMap.get(offlineInv.invoiceCode || "") || serverMap.get(offlineInv.id);
+        if (match) {
+          const totalOffline = offlineInv.totalPayable || 0;
+          const totalServer = match.totalPayable || 0;
+          const totalDiff = Math.abs(totalOffline - totalServer) > 0.1;
+          const itemsDiff = (offlineInv.items?.length || 0) !== (match.items?.length || 0);
+          const paymentDiff = offlineInv.paymentMethod !== match.paymentMethod;
+
+          if (totalDiff || itemsDiff || paymentDiff) {
+            discrepancies.push(
+              `Hóa đơn ${offlineInv.invoiceCode || offlineInv.id.substring(0, 8)} bị lệch dữ liệu (Tổng tiền/Sản phẩm/Phương thức không khớp giữa offline và server).`
+            );
+          } else {
+            discrepancies.push(
+              `Hóa đơn ${offlineInv.invoiceCode || offlineInv.id.substring(0, 8)} đã có trên Server nhưng vẫn nằm trong hàng đợi offline.`
+            );
+          }
+        }
+      }
+
+      const timestamp = new Date().toISOString();
+      const hasDiff = discrepancies.length > 0;
+
+      localStorage.setItem("kiot_last_integrity_check", timestamp);
+
+      setIntegrityStatus({
+        lastChecked: timestamp,
+        hasDiscrepancy: hasDiff,
+        discrepancyCount: discrepancies.length,
+        details: discrepancies
+      });
+
+      if (hasDiff) {
+        safeDispatchEvent("kiot-toast", {
+          type: "stock-warning",
+          title: "Cảnh báo toàn vẹn dữ liệu ⚠️",
+          message: `Hệ thống phát hiện ${discrepancies.length} hóa đơn bị chênh lệch hoặc trùng lặp giữa hàng đợi offline và server. Vui lòng kiểm tra lại!`
+        });
+      } else if (!silent) {
+        safeDispatchEvent("kiot-toast", {
+          type: "success",
+          title: "Dữ liệu hoàn toàn khớp! 🎉",
+          message: "Tính toàn vẹn dữ liệu được đảm bảo. Không phát hiện chênh lệch giữa hàng đợi offline và server."
+        });
+      }
+      return hasDiff;
+    } catch (err) {
+      console.error("Error running checksum validation:", err);
+      return false;
+    }
+  }, []);
+
+  // Integrity Check interval timer: every 5 minutes (300,000ms)
+  useEffect(() => {
+    // Run an initial check shortly after app starts (e.g., 5 seconds)
+    const initialTimeout = setTimeout(() => {
+      runChecksumValidation(true);
+    }, 5000);
+
+    const interval = setInterval(() => {
+      console.log("[Integrity Check] Running scheduled 5-minute checksum validation...");
+      runChecksumValidation(true);
+    }, 5 * 60 * 1000); // 5 minutes
+
+    return () => {
+      clearTimeout(initialTimeout);
+      clearInterval(interval);
+    };
+  }, [runChecksumValidation]);
 
   const isTabAllowed = (tabId: string, roleOrStaff: string | Staff | null | undefined): boolean => {
     if (!roleOrStaff) return false;
@@ -143,6 +260,16 @@ export default function App() {
     // Bypass permissions for Super Admin
     if (staffMember && staffMember.email?.toLowerCase() === "congbaotruong8@gmail.com") return true;
     if (currentStaff && currentStaff.email?.toLowerCase() === "congbaotruong8@gmail.com") return true;
+
+    // Check Store-level Feature Restrictions set by Software Admin
+    if (trialInfo?.allowedModules) {
+      const flags = trialInfo.allowedModules;
+      if (tabId === "pos" && !isModuleEnabled(flags.pos)) return false;
+      if (tabId === "products" && !isModuleEnabled(flags.products)) return false;
+      if (tabId === "partners" && !isModuleEnabled(flags.partners)) return false;
+      if (tabId === "cashbook" && !isModuleEnabled(flags.cashbook)) return false;
+      if (tabId === "dashboard" && !isModuleEnabled(flags.reports)) return false;
+    }
 
     if (role === "OWNER") return true;
 
@@ -602,7 +729,7 @@ export default function App() {
     }
   };
 
-  const handleUpdateTrialPassword = async (id: string, newPassword: string) => {
+  const handleUpdateTrialPassword = async (id: string, newPassword?: string, newEmail?: string) => {
     try {
       let targetTrial = trialRegistrations.find(t => t.id === id);
       if (!targetTrial && trialInfo && trialInfo.id === id) {
@@ -611,8 +738,30 @@ export default function App() {
       if (targetTrial) {
         const updated = { 
           ...targetTrial, 
-          password: newPassword
         };
+        if (newPassword) {
+          updated.password = newPassword;
+        }
+        if (newEmail && newEmail.trim() !== "") {
+          updated.email = newEmail.trim().toLowerCase();
+          
+          // Keep default OWNER staff email in sync so login is smooth
+          const oldEmail = targetTrial.email;
+          const updatedStaff = staff.map(s => {
+            if (s.email.toLowerCase() === oldEmail.toLowerCase() && s.role === "OWNER") {
+              return { ...s, email: newEmail.trim().toLowerCase() };
+            }
+            return s;
+          });
+          saveStaff(updatedStaff);
+
+          // Update currentStaff if they are the OWNER whose email is being updated
+          if (currentStaff && currentStaff.role === "OWNER" && currentStaff.email.toLowerCase() === oldEmail.toLowerCase()) {
+            const updatedCurrentStaff = { ...currentStaff, email: newEmail.trim().toLowerCase() };
+            setCurrentStaff(updatedCurrentStaff);
+            localStorage.setItem("kiot_current_staff", JSON.stringify(updatedCurrentStaff));
+          }
+        }
 
         // 1. Update on Firebase Firestore first
         await safeSetDoc(doc(db, "kiot_trials", id), updated);
@@ -623,7 +772,7 @@ export default function App() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(updated)
         });
-        if (!res.ok) throw new Error("Cập nhật mật khẩu trên server thất bại");
+        if (!res.ok) throw new Error("Cập nhật thông tin tài khoản trên server thất bại");
 
         // Force reload from backend
         const trialsRes = await fetch("/api/trials");
@@ -647,13 +796,57 @@ export default function App() {
 
         safeDispatchEvent("kiot-toast", {
           type: "success",
-          title: "Đã đổi mật khẩu",
-          message: `Thay đổi mật khẩu cho cửa hàng "${targetTrial.shopName}" thành công.`
+          title: "Đã cập nhật tài khoản",
+          message: `Cập nhật thông tin đăng nhập cho cửa hàng "${targetTrial.shopName}" thành công.`
         });
       }
     } catch (err: any) {
       console.error("Lỗi cập nhật mật khẩu:", err);
       alert(`Không thể đổi mật khẩu dùng thử: ${err.message || err}`);
+    }
+  };
+
+  const handleUpdateTrialAllowedModules = async (id: string, allowedModules: StoreFeatureFlags) => {
+    try {
+      const targetTrial = trialRegistrations.find(t => t.id === id);
+      if (!targetTrial) return;
+
+      const updated: TrialRegistration = { ...targetTrial, allowedModules };
+
+      // 1. Update state immediately
+      setTrialRegistrations(prev => prev.map(t => t.id === id ? updated : t));
+
+      // 2. Update Firebase Firestore
+      await safeSetDoc(doc(db, "kiot_trials", id), updated);
+
+      // 3. Update PostgreSQL server
+      const res = await fetch("/api/trials", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(updated)
+      });
+      if (!res.ok) throw new Error("Cập nhật phân quyền tính năng trên server thất bại");
+
+      // 4. Update current trialInfo if matches
+      const localTrialStr = localStorage.getItem("kiot_trial_info");
+      if (localTrialStr) {
+        try {
+          const localTrial = JSON.parse(localTrialStr) as TrialRegistration;
+          if (localTrial.id === id) {
+            localStorage.setItem("kiot_trial_info", JSON.stringify(updated));
+            setTrialInfo(updated);
+          }
+        } catch (e) {}
+      }
+
+      safeDispatchEvent("kiot-toast", {
+        type: "success",
+        title: "Đã cập nhật phân quyền 🔒",
+        message: `Cập nhật phân quyền tính năng cho cửa hàng "${targetTrial.shopName}" thành công.`
+      });
+    } catch (err: any) {
+      console.error("Lỗi cập nhật phân quyền cửa hàng:", err);
+      alert(`Không thể phân quyền tính năng cửa hàng: ${err.message || err}`);
     }
   };
 
@@ -774,6 +967,75 @@ export default function App() {
     }
   };
 
+  const handleCreateTrial = async (newTrial: Omit<TrialRegistration, 'id' | 'createdAt'>) => {
+    try {
+      const cleanEmail = newTrial.email.trim().toLowerCase();
+      
+      // Explicitly block admin email
+      if (cleanEmail === "congbaotruong8@gmail.com") {
+        alert(`Lỗi tạo: Không thể sử dụng email quản trị viên "congbaotruong8@gmail.com" để cấp tài khoản dùng thử.`);
+        return;
+      }
+
+      // Check if email already registered
+      const isExisted = trialRegistrations.some(t => t.email.trim().toLowerCase() === cleanEmail);
+      if (isExisted) {
+        alert(`Lỗi tạo: Gmail/Email "${newTrial.email}" đã được đăng ký dùng thử trước đó trên hệ thống! Vui lòng chọn địa chỉ email khác.`);
+        return;
+      }
+
+      // Check if phone already registered (both exact and clean digits matching)
+      const cleanPhoneDigits = newTrial.phone.replace(/\D/g, "");
+      const isPhoneExisted = trialRegistrations.some(t => {
+        const dPhoneClean = (t.phone || "").replace(/\D/g, "");
+        return (dPhoneClean === cleanPhoneDigits && cleanPhoneDigits.length > 0) || t.phone === newTrial.phone.trim();
+      });
+      if (isPhoneExisted) {
+        alert(`Lỗi tạo: Số điện thoại "${newTrial.phone}" này đã được đăng ký dùng thử trước đó trên hệ thống! Vui lòng sử dụng số điện thoại khác.`);
+        return;
+      }
+
+      const trialId = `trial-${Date.now()}`;
+      const createdAt = new Date().toISOString();
+      const trialData: TrialRegistration = {
+        ...newTrial,
+        id: trialId,
+        createdAt,
+      };
+
+      // 1. Save directly to Firestore for congbaotruong8@gmail.com to see
+      await safeSetDoc(doc(db, "kiot_trials", trialId), trialData);
+
+      // 2. Sync directly to PostgreSQL database
+      const res = await fetch("/api/trials", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(trialData),
+      });
+
+      if (!res.ok) throw new Error("Không thể lưu đăng ký dùng thử lên server");
+
+      // 3. Force reload from backend
+      const trialsRes = await fetch("/api/trials");
+      if (trialsRes.ok) {
+        const list = await trialsRes.json();
+        list.sort((a: any, b: any) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+        setTrialRegistrations(list);
+      }
+
+      safeDispatchEvent("kiot-toast", {
+        type: "success",
+        title: "Tạo khách hàng thành công",
+        message: `Cửa hàng dùng thử "${trialData.shopName}" đã được tạo thành công thủ công.`
+      });
+    } catch (err: any) {
+      console.error("Lỗi tạo khách hàng thủ công:", err);
+      alert(`Không thể tạo khách hàng: ${err.message || err}`);
+    }
+  };
+
   // 4. Live Clock Ticker
   useEffect(() => {
     const ticker = setInterval(() => {
@@ -786,6 +1048,15 @@ export default function App() {
   // 4a. Global Keyboard Shortcuts Listener for Cashier/POS Quick Actions
   useEffect(() => {
     const handleGlobalKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "F3") {
+        if (currentStaff && !isTabAllowed("cashbook", currentStaff)) {
+          return;
+        }
+        e.preventDefault();
+        handleTabChange("cashbook");
+        return;
+      }
+
       const posKeys = ["F1", "F2", "F4", "F8", "F9"];
       if (!posKeys.includes(e.key)) return;
 
@@ -797,7 +1068,7 @@ export default function App() {
       // If they are on another tab, automatically redirect them to the POS tab first!
       if (activeTab !== "pos") {
         e.preventDefault();
-        setActiveTab("pos");
+        handleTabChange("pos");
 
         // Stagger slightly to allow the POS component to fully mount
         setTimeout(() => {
@@ -838,38 +1109,116 @@ export default function App() {
 
   // 4b. Firebase Auth and Role-Based Login Handlers
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (user) => {
+    const unsubscribe = onAuthStateChanged(auth, async (user) => {
       if (user) {
-        // Find if this Google email matches any existing staff member in KiotX local database
-        const matched = staff.find(s => s.email.toLowerCase() === user.email?.toLowerCase());
-        if (matched) {
-          setCurrentStaff(matched);
-          localStorage.setItem("kiot_current_staff", JSON.stringify(matched));
-        } else {
-          // Dynamically provision them an OWNER role so they can test their own Google Account with full features
-          const newStaff: Staff = {
+        const userEmail = user.email?.toLowerCase() || "";
+        console.log(`[onAuthStateChanged] Google user logged in: ${userEmail}`);
+
+        // 1. Check if the user is the Super Admin (congbaotruong8@gmail.com)
+        if (userEmail === "congbaotruong8@gmail.com") {
+          const adminStaff: Staff = {
+            id: `staff-${user.uid}`,
+            name: "Trương Công Bảo (Super Admin)",
+            email: "congbaotruong8@gmail.com",
+            role: "OWNER",
+            phone: "0901234567",
+            active: true
+          };
+          setCurrentStaff(adminStaff);
+          localStorage.setItem("kiot_current_staff", JSON.stringify(adminStaff));
+          
+          // Clear any active trial info since admin is viewing overall SaaS system
+          setTrialInfo(null);
+          localStorage.removeItem("kiot_trial_info");
+          return;
+        }
+
+        // 2. For any other Google/Gmail user:
+        // Automatically check/create their trial registration so they get their own store
+        try {
+          const { collection, getDocs, query, where, doc } = await import("firebase/firestore");
+          const trialsRef = collection(db, "kiot_trials");
+          const q = query(trialsRef, where("email", "==", userEmail));
+          const querySnapshot = await getDocs(q);
+          
+          let userTrial: TrialRegistration | null = null;
+          
+          if (!querySnapshot.empty) {
+            userTrial = querySnapshot.docs[0].data() as TrialRegistration;
+            console.log(`[onAuthStateChanged] Found existing trial for ${userEmail}:`, userTrial);
+          } else {
+            // Auto-provision a new TrialRegistration (SaaS Trial user) on the fly!
+            console.log(`[onAuthStateChanged] Auto-registering new SaaS trial for Gmail: ${userEmail}`);
+            const trialId = `trial-${user.uid}`;
+            const createdAt = new Date().toISOString();
+            const expireDate = new Date(Date.now() + 20 * 24 * 60 * 60 * 1000).toISOString(); // 20 days
+            
+            userTrial = {
+              id: trialId,
+              shopName: `Cửa hàng của ${user.displayName || user.email?.split("@")[0]}`,
+              ownerName: user.displayName || user.email?.split("@")[0] || "Khách hàng Google",
+              phone: "",
+              email: userEmail,
+              password: "", // Google accounts don't need passwords
+              address: "Đăng nhập qua Google",
+              notes: "Tự động kích hoạt qua Google Sign-In",
+              createdAt,
+              expireDate,
+              status: "TRIAL_ACTIVE"
+            };
+            
+            // Save to Firestore
+            await safeSetDoc(doc(db, "kiot_trials", trialId), userTrial);
+            
+            // Sync to PostgreSQL server
+            try {
+              await fetch("/api/trials", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(userTrial)
+              });
+            } catch (pgErr) {
+              console.warn("Lỗi đồng bộ dùng thử Google mới sang PostgreSQL:", pgErr);
+            }
+          }
+          
+          // Set trial info
+          setTrialInfo(userTrial);
+          localStorage.setItem("kiot_trial_info", JSON.stringify(userTrial));
+          
+          // Now prepare the client staff state for this user
+          const trialStaff: Staff = {
             id: `staff-${user.uid}`,
             name: user.displayName || user.email?.split("@")[0] || "Chủ cửa hàng (Google)",
-            email: user.email || "",
+            email: userEmail,
             role: "OWNER",
             phone: "",
             active: true
           };
-          setStaff(prev => {
-            if (!prev.some(s => s.email.toLowerCase() === newStaff.email.toLowerCase())) {
-              const updated = [...prev, newStaff];
-              localStorage.setItem("kiot_staff", JSON.stringify(updated));
-              return updated;
-            }
-            return prev;
-          });
-          setCurrentStaff(newStaff);
-          localStorage.setItem("kiot_current_staff", JSON.stringify(newStaff));
+          
+          setCurrentStaff(trialStaff);
+          localStorage.setItem("kiot_current_staff", JSON.stringify(trialStaff));
+          
+          // Also make sure they are in the active staff list for their prefix
+          const prefix = `kiot_trial_${userTrial.id}_`;
+          const localStaffStr = localStorage.getItem(`${prefix}staff`);
+          let trialStaffList: Staff[] = [];
+          if (localStaffStr) {
+            try { trialStaffList = JSON.parse(localStaffStr); } catch (e) {}
+          }
+          if (!trialStaffList.some(s => s.email.toLowerCase() === userEmail)) {
+            trialStaffList.push(trialStaff);
+            localStorage.setItem(`${prefix}staff`, JSON.stringify(trialStaffList));
+          }
+          setStaff(trialStaffList);
+          
+        } catch (err) {
+          console.error("Lỗi đồng bộ hoặc khởi tạo tài khoản dùng thử Google:", err);
         }
       }
     });
     return () => unsubscribe();
-  }, [staff]);
+  }, []);
 
   const handleGoogleLogin = async () => {
     try {
@@ -880,9 +1229,31 @@ export default function App() {
         message: "Tài khoản Google đã kết nối và đồng bộ vai trò thành viên."
       });
     } catch (err: any) {
-      console.error("Lỗi Google Sign-In:", err);
-      if (err?.code !== "auth/popup-closed-by-user") {
-        alert("Không thể kết nối hoặc xác thực với Google Auth. Chi tiết: " + err.message);
+      console.warn("Lỗi Google Sign-In:", err?.code, err?.message);
+      if (err?.code === "auth/popup-closed-by-user" || err?.code === "auth/cancelled-popup-request") {
+        safeDispatchEvent("kiot-toast", {
+          type: "warning",
+          title: "Đã hủy đăng nhập",
+          message: "Cửa sổ đăng nhập Google đã được đóng."
+        });
+      } else if (err?.code === "auth/popup-blocked") {
+        safeDispatchEvent("kiot-toast", {
+          type: "warning",
+          title: "Cửa sổ Pop-up bị chặn",
+          message: "Trình duyệt đang chặn cửa sổ đăng nhập Google. Vui lòng cho phép Pop-up trên trình duyệt hoặc đăng nhập bằng tài khoản nhanh / mật khẩu."
+        });
+      } else if (err?.code === "auth/unauthorized-domain") {
+        safeDispatchEvent("kiot-toast", {
+          type: "error",
+          title: "Tên miền chưa được cấp quyền",
+          message: "Tên miền hiện tại cần được thêm vào Firebase Authorized Domains."
+        });
+      } else {
+        safeDispatchEvent("kiot-toast", {
+          type: "error",
+          title: "Không thể kết nối Google Auth",
+          message: err?.message || "Vui lòng thử lại hoặc đăng nhập bằng tài khoản mẫu / mật khẩu."
+        });
       }
     }
   };
@@ -893,9 +1264,9 @@ export default function App() {
     
     // Automatically redirect CASHIER to POS screen, and OWNER/MANAGER to Dashboard
     if (selected.role === "CASHIER") {
-      setActiveTab("pos");
+      handleTabChange("pos");
     } else {
-      setActiveTab("dashboard");
+      handleTabChange("dashboard");
     }
 
     safeDispatchEvent("kiot-toast", {
@@ -907,6 +1278,34 @@ export default function App() {
 
   const handleLogout = async () => {
     await signOut(auth).catch(() => {});
+    
+    if (currentStaff) {
+      const logoutLog: SystemAuditLog = {
+        id: `log-logout-${Date.now()}`,
+        actionType: "USER_LOGOUT",
+        actionName: "Đăng xuất hệ thống",
+        description: `Nhân viên ${currentStaff.name} đã đăng xuất khỏi phiên làm việc an toàn.`,
+        actorName: currentStaff.name,
+        actorRole: currentStaff.role,
+        timestamp: new Date().toISOString()
+      };
+      
+      const updatedLogs = [logoutLog, ...systemLogs];
+      setSystemLogs(updatedLogs);
+      localStorage.setItem(getDynamicKey("system_logs"), JSON.stringify(updatedLogs));
+      
+      if (isOnline && autoSyncEnabled) {
+        safeSetDoc(doc(db, "kiot_system_logs", logoutLog.id), logoutLog).catch(err => {
+          console.error("Lỗi đồng bộ nhật ký đăng xuất lên Firestore:", err);
+        });
+        triggerSyncAll({ systemLogs: updatedLogs }, true);
+      }
+      
+      // Clean up sessionStorage keys for this staff to allow new login log on re-login
+      const loggedKeyToday = `kiot_login_logged_for_${currentStaff.id}_${new Date().toISOString().slice(0, 10)}`;
+      sessionStorage.removeItem(loggedKeyToday);
+    }
+
     setCurrentStaff(null);
     setTrialInfo(null);
     setTrialDaysLeft(null);
@@ -960,14 +1359,33 @@ export default function App() {
         await safeSetDoc(doc(db, "kiot_invoices", inv.id), inv);
       }
       
-      // Clear offline queue
+      // Directly sync all current states (including newly processed offline invoices and cashbook logs) to PostgreSQL
+      if (autoSyncEnabled) {
+        const latestInvoices = JSON.parse(localStorage.getItem(getDynamicKey("invoices")) || "[]");
+        const latestProducts = JSON.parse(localStorage.getItem(getDynamicKey("products")) || "[]");
+        const latestCustomers = JSON.parse(localStorage.getItem(getDynamicKey("customers")) || "[]");
+        const latestCashbook = JSON.parse(localStorage.getItem(getDynamicKey("cashbook")) || "[]");
+
+        const syncSuccess = await triggerSyncAll({
+          invoices: latestInvoices,
+          products: latestProducts,
+          customers: latestCustomers,
+          cashbook: latestCashbook
+        }, true);
+
+        if (!syncSuccess) {
+          throw new Error("Không thể đồng bộ dữ liệu sang PostgreSQL (Cloud SQL).");
+        }
+      }
+
+      // Clear offline queue ONLY AFTER successful sync to both Firestore and PostgreSQL!
       localStorage.setItem("kiot_offline_queue", JSON.stringify([]));
       setOfflineQueue([]);
 
       safeDispatchEvent("kiot-toast", {
         type: "success",
         title: "Đồng bộ thành công! 🎉",
-        message: `Đã đẩy thành công ${queueToSync.length} hóa đơn từ thiết bị cục bộ lên cơ sở dữ liệu đám mây.`
+        message: `Đã đẩy thành công ${queueToSync.length} hóa đơn từ thiết bị cục bộ lên cơ sở dữ liệu đám mây và máy chủ PostgreSQL.`
       });
     } catch (err: any) {
       console.error("Lỗi đồng bộ đám mây:", err);
@@ -981,34 +1399,119 @@ export default function App() {
     }
   };
 
-  // Monitor online/offline states from the browser environment
+  // Monitor online/offline states from the browser environment & active ping check
   useEffect(() => {
-    const handleOnline = () => {
-      setIsOnline(true);
-      safeDispatchEvent("kiot-toast", {
-        type: "success",
-        title: "Đã khôi phục kết nối",
-        message: "Đã phát hiện thấy tín hiệu mạng internet! Hệ thống tự động chuyển sang chế độ trực tuyến."
-      });
+    let active = true;
+
+    // Active polling ping to detect connection cuts or slow failures on real machines
+    const checkRealInternet = async (): Promise<boolean> => {
+      if (typeof window !== "undefined" && !window.navigator.onLine) {
+        return false;
+      }
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 3500);
+        
+        const res = await fetch(`/api/ping?t=${Date.now()}`, { 
+          method: "GET",
+          signal: controller.signal,
+          headers: { 
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0"
+          }
+        });
+        clearTimeout(timeoutId);
+        return res.ok;
+      } catch (e) {
+        return false;
+      }
+    };
+
+    const handleOnline = async () => {
+      // Re-verify with active ping to be 100% sure we have real internet before going online
+      const isReallyOnline = await checkRealInternet();
+      if (!active) return;
+      
+      setIsRealOnline(isReallyOnline);
+      if (isReallyOnline) {
+        if (!isManualOffline) {
+          setIsOnline(true);
+          safeDispatchEvent("kiot-toast", {
+            type: "success",
+            title: "Đã kết nối Wi-Fi/Internet! 🌐",
+            message: "Đã phát hiện tín hiệu mạng trực tuyến trên máy thật. Hệ thống chuyển sang chế độ Online."
+          });
+        }
+      } else {
+        setIsOnline(false);
+        safeDispatchEvent("kiot-toast", {
+          type: "stock-warning",
+          title: "Không có Internet thực tế ⚠️",
+          message: "Máy đã kết nối Wi-Fi nhưng không có internet. Hệ thống chuyển sang chế độ Offline."
+        });
+      }
     };
 
     const handleOffline = () => {
+      setIsRealOnline(false);
       setIsOnline(false);
       safeDispatchEvent("kiot-toast", {
         type: "stock-warning",
-        title: "Mất kết nối mạng",
-        message: "Mất tín hiệu internet. Hệ thống đã tự động chuyển sang chế độ hoạt động ngoại tuyến (Offline)."
+        title: "Mất kết nối mạng máy thật! ❌",
+        message: "Hệ thống đã nhận biết thiết bị vừa mất kết nối Wi-Fi/Internet trên máy thật. Đã chuyển sang chế độ bán hàng Ngoại tuyến (Offline)."
       });
     };
 
     window.addEventListener("online", handleOnline);
     window.addEventListener("offline", handleOffline);
 
+    // Perform continuous background real-network health checks every 8 seconds
+    const interval = setInterval(async () => {
+      const isReallyOnline = await checkRealInternet();
+      if (!active) return;
+
+      setIsRealOnline(isReallyOnline);
+
+      if (!isReallyOnline) {
+        if (isOnline) {
+          setIsOnline(false);
+          safeDispatchEvent("kiot-toast", {
+            type: "stock-warning",
+            title: "Sự cố mất kết nối mạng! 📡",
+            message: "Mất tín hiệu kết nối Wi-Fi/Mạng trên máy thật. Hệ thống chuyển đổi tức thì sang chế độ Ngoại tuyến để tránh gián đoạn."
+          });
+        }
+      } else {
+        // If it got restored and user was offline but didn't force offline manually
+        if (!isOnline && !isManualOffline) {
+          setIsOnline(true);
+          safeDispatchEvent("kiot-toast", {
+            type: "success",
+            title: "Mạng trực tuyến trở lại! ✅",
+            message: "Đã kết nối lại Wi-Fi và Internet thành công trên máy thật. Hệ thống bắt đầu đồng bộ hóa."
+          });
+        }
+      }
+    }, 8000);
+
+    // Initial hardware connection verification on mount
+    checkRealInternet().then(status => {
+      if (active) {
+        setIsRealOnline(status);
+        if (!status && isOnline) {
+          setIsOnline(false);
+        }
+      }
+    });
+
     return () => {
+      active = false;
       window.removeEventListener("online", handleOnline);
       window.removeEventListener("offline", handleOffline);
+      clearInterval(interval);
     };
-  }, []);
+  }, [isOnline, isManualOffline]);
 
   // Trigger sync automatically when going online
   useEffect(() => {
@@ -1059,6 +1562,45 @@ export default function App() {
     };
   }, [isOnline, autoSyncEnabled]);
 
+  // 4d. Automatically log Login and Logout events in System Audit Log
+  useEffect(() => {
+    if (currentStaff) {
+      const loggedKey = `kiot_login_logged_for_${currentStaff.id}_${new Date().toISOString().slice(0, 10)}`;
+      const alreadyLogged = sessionStorage.getItem(loggedKey);
+      
+      if (!alreadyLogged) {
+        // Mark as logged in this browser session for today
+        sessionStorage.setItem(loggedKey, "true");
+        
+        // Add log entry
+        const loginLog: SystemAuditLog = {
+          id: `log-login-${Date.now()}`,
+          actionType: "USER_LOGIN",
+          actionName: "Đăng nhập hệ thống",
+          description: `Thành viên ${currentStaff.name} (vai trò ${
+            currentStaff.role === "OWNER" ? "Chủ cửa hàng" : currentStaff.role === "MANAGER" ? "Quản lý" : "Thu ngân"
+          }) đã đăng nhập thành công vào hệ thống KiotX Pro.`,
+          actorName: currentStaff.name,
+          actorRole: currentStaff.role,
+          timestamp: new Date().toISOString()
+        };
+        
+        setSystemLogs(prev => {
+          const updated = [loginLog, ...prev];
+          localStorage.setItem(getDynamicKey("system_logs"), JSON.stringify(updated));
+          if (isOnline && autoSyncEnabled) {
+            safeSetDoc(doc(db, "kiot_system_logs", loginLog.id), loginLog).catch(err => {
+              console.error("Lỗi đồng bộ nhật ký đăng nhập lên Firestore:", err);
+            });
+            // Trigger sync all
+            triggerSyncAll({ systemLogs: updated }, true);
+          }
+          return updated;
+        });
+      }
+    }
+  }, [currentStaff, isOnline, autoSyncEnabled, trialInfo]);
+
   // 5. State Persistence Helpers (Save to state + LocalStorage)
   const getDynamicKey = (baseKey: string) => {
     return trialInfo ? `kiot_trial_${trialInfo.id}_${baseKey}` : `kiot_${baseKey}`;
@@ -1083,33 +1625,48 @@ export default function App() {
     }
     setProducts(updated);
     localStorage.setItem(getDynamicKey("products"), JSON.stringify(updated));
+    if (isOnline && autoSyncEnabled) {
+      triggerSyncAll({ products: updated }, true);
+    }
   };
 
   const saveCategories = (updated: Category[]) => {
     setCategories(updated);
     localStorage.setItem(getDynamicKey("categories"), JSON.stringify(updated));
+    if (isOnline && autoSyncEnabled) {
+      triggerSyncAll({ categories: updated }, true);
+    }
   };
 
   const saveCustomers = (updated: Customer[]) => {
     setCustomers(updated);
     localStorage.setItem(getDynamicKey("customers"), JSON.stringify(updated));
+    if (isOnline && autoSyncEnabled) {
+      triggerSyncAll({ customers: updated }, true);
+    }
   };
 
   const saveSuppliers = (updated: Supplier[]) => {
     setSuppliers(updated);
     localStorage.setItem(getDynamicKey("suppliers"), JSON.stringify(updated));
+    if (isOnline && autoSyncEnabled) {
+      triggerSyncAll({ suppliers: updated }, true);
+    }
   };
 
   const saveInvoices = (updated: Invoice[]) => {
     setInvoices(updated);
     localStorage.setItem(getDynamicKey("invoices"), JSON.stringify(updated));
+    if (isOnline && autoSyncEnabled) {
+      triggerSyncAll({ invoices: updated }, true);
+    }
   };
 
   const saveStaff = (updated: Staff[]) => {
     setStaff(updated);
     localStorage.setItem(getDynamicKey("staff"), JSON.stringify(updated));
     if (isOnline && autoSyncEnabled) {
-      triggerSyncAll();
+      triggerSyncAll({ staff: updated }, true);
     }
   };
 
@@ -1119,58 +1676,111 @@ export default function App() {
     
     // Update HTML tab title dynamically
     document.title = updated.shopName;
+    if (isOnline && autoSyncEnabled) {
+      triggerSyncAll({ settings: updated }, true);
+    }
   };
 
   const saveAudits = (updated: InventoryAudit[]) => {
     setAudits(updated);
     localStorage.setItem(getDynamicKey("audits"), JSON.stringify(updated));
+    if (isOnline && autoSyncEnabled) {
+      triggerSyncAll({ audits: updated }, true);
+    }
   };
 
   const savePurchaseOrders = (updated: PurchaseOrder[]) => {
     setPurchaseOrders(updated);
     localStorage.setItem(getDynamicKey("purchase_orders"), JSON.stringify(updated));
+    if (isOnline && autoSyncEnabled) {
+      triggerSyncAll({ purchaseOrders: updated }, true);
+    }
   };
 
   const saveCashbook = (updated: CashbookEntry[]) => {
     setCashbook(updated);
     localStorage.setItem(getDynamicKey("cashbook"), JSON.stringify(updated));
+    if (isOnline && autoSyncEnabled) {
+      triggerSyncAll({ cashbook: updated }, true);
+    }
   };
 
   const saveProjects = (updated: Project[]) => {
     setProjects(updated);
     localStorage.setItem(getDynamicKey("projects"), JSON.stringify(updated));
+    if (isOnline && autoSyncEnabled) {
+      triggerSyncAll({ projects: updated }, true);
+    }
   };
 
   const saveCashShifts = (updated: CashShift[]) => {
     setCashShifts(updated);
     localStorage.setItem(getDynamicKey("cash_shifts"), JSON.stringify(updated));
+    if (isOnline && autoSyncEnabled) {
+      triggerSyncAll({ cashShifts: updated }, true);
+    }
   };
 
   const saveSystemLogs = (updated: SystemAuditLog[]) => {
     setSystemLogs(updated);
     localStorage.setItem(getDynamicKey("system_logs"), JSON.stringify(updated));
+    if (isOnline && autoSyncEnabled) {
+      triggerSyncAll({ systemLogs: updated }, true);
+    }
   };
 
   // PostgreSQL Full Cloud Backup & Synchronize Engine
-  const triggerSyncAll = async () => {
+  const triggerSyncAll = async (
+    overrides?: {
+      products?: Product[];
+      categories?: Category[];
+      customers?: Customer[];
+      suppliers?: Supplier[];
+      invoices?: Invoice[];
+      staff?: Staff[];
+      settings?: ShopSetting;
+      audits?: InventoryAudit[];
+      purchaseOrders?: PurchaseOrder[];
+      cashbook?: CashbookEntry[];
+      projects?: Project[];
+      cashShifts?: CashShift[];
+      systemLogs?: SystemAuditLog[];
+    },
+    silent = false
+  ): Promise<boolean> => {
     if (!isOnline) {
-      safeDispatchEvent("kiot-toast", {
-        type: "stock-warning",
-        title: "Đồng bộ thất bại",
-        message: "Không thể tiến hành đồng bộ khi đang ngoại tuyến (Offline)."
-      });
-      return;
+      if (!silent) {
+        safeDispatchEvent("kiot-toast", {
+          type: "stock-warning",
+          title: "Đồng bộ thất bại",
+          message: "Không thể tiến hành đồng bộ khi đang ngoại tuyến (Offline)."
+        });
+      }
+      return false;
     }
 
     const tenantId = trialInfo?.id || "demo";
-    setIsSyncingAll(true);
+    if (!silent) setIsSyncingAll(true);
     try {
-      const response = await fetch(`/api/kiot/sync/${tenantId}`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
+      let syncPayload: any = {};
+      if (overrides) {
+        // Partial update: ONLY send tables explicitly specified in overrides
+        if (overrides.products !== undefined) syncPayload.products = overrides.products;
+        if (overrides.categories !== undefined) syncPayload.categories = overrides.categories;
+        if (overrides.customers !== undefined) syncPayload.customers = overrides.customers;
+        if (overrides.suppliers !== undefined) syncPayload.suppliers = overrides.suppliers;
+        if (overrides.invoices !== undefined) syncPayload.invoices = overrides.invoices;
+        if (overrides.staff !== undefined) syncPayload.staff = overrides.staff;
+        if (overrides.settings !== undefined) syncPayload.settings = overrides.settings;
+        if (overrides.audits !== undefined) syncPayload.audits = overrides.audits;
+        if (overrides.purchaseOrders !== undefined) syncPayload.purchaseOrders = overrides.purchaseOrders;
+        if (overrides.cashbook !== undefined) syncPayload.cashbook = overrides.cashbook;
+        if (overrides.projects !== undefined) syncPayload.projects = overrides.projects;
+        if (overrides.cashShifts !== undefined) syncPayload.cashShifts = overrides.cashShifts;
+        if (overrides.systemLogs !== undefined) syncPayload.systemLogs = overrides.systemLogs;
+      } else {
+        // Full update: send everything
+        syncPayload = {
           products,
           categories,
           customers,
@@ -1182,33 +1792,77 @@ export default function App() {
           purchaseOrders,
           cashbook,
           projects,
+          cashShifts,
           systemLogs
-        })
-      });
+        };
+      }
+
+      let response: Response | null = null;
+      let lastFetchErr: any = null;
+      const jsonBody = JSON.stringify(syncPayload);
+
+      // Retry up to 3 times for transient network/fetch interruptions
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          response = await fetch(`/api/kiot/sync/${tenantId}`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json"
+            },
+            body: jsonBody
+          });
+          if (response) break;
+        } catch (fetchErr: any) {
+          lastFetchErr = fetchErr;
+          console.warn(`[Kiot Sync Retry ${attempt}/3] Network interruption:`, fetchErr);
+          if (attempt < 3) {
+            await new Promise((resolve) => setTimeout(resolve, 800 * attempt));
+          }
+        }
+      }
+
+      if (!response) {
+        throw new Error(
+          lastFetchErr?.message === "Failed to fetch"
+            ? "Kết nối mạng hoặc máy chủ đồng bộ tạm thời bị gián đoạn (Failed to fetch). Dữ liệu đã được lưu an toàn tại máy của bạn và sẽ tự đồng bộ khi có mạng."
+            : (lastFetchErr?.message || "Không thể kết nối máy chủ đồng bộ PostgreSQL.")
+        );
+      }
 
       if (!response.ok) {
         const errorText = await response.text();
-        throw new Error(errorText || "Không phản hồi từ PostgreSQL.");
+        let parsedErr = errorText;
+        try {
+          const errObj = JSON.parse(errorText);
+          if (errObj && errObj.error) parsedErr = errObj.error;
+        } catch (_) {}
+        throw new Error(parsedErr || "Máy chủ PostgreSQL phản hồi lỗi (Mã " + response.status + ").");
       }
 
       const nowStr = new Date().toISOString();
       setLastSyncTime(nowStr);
       localStorage.setItem("kiot_last_sync_time", nowStr);
 
-      safeDispatchEvent("kiot-toast", {
-        type: "success",
-        title: "Đồng bộ PostgreSQL thành công! 🎉",
-        message: "Tất cả dữ liệu sản phẩm, hóa đơn, cấu hình của bạn đã được sao lưu an toàn lên cơ sở dữ liệu PostgreSQL (Cloud SQL)."
-      });
+      if (!silent) {
+        safeDispatchEvent("kiot-toast", {
+          type: "success",
+          title: "Đồng bộ PostgreSQL thành công! 🎉",
+          message: "Tất cả dữ liệu sản phẩm, hóa đơn, cấu hình của bạn đã được sao lưu an toàn lên cơ sở dữ liệu PostgreSQL (Cloud SQL)."
+        });
+      }
+      return true;
     } catch (error: any) {
       console.error("Lỗi đồng bộ PostgreSQL: ", error);
-      safeDispatchEvent("kiot-toast", {
-        type: "stock-warning",
-        title: "Lỗi đồng bộ đám mây",
-        message: `Không thể lưu dữ liệu vào cơ sở dữ liệu PostgreSQL: ${error?.message || "Lỗi kết nối máy chủ backend"}.`
-      });
+      if (!silent) {
+        safeDispatchEvent("kiot-toast", {
+          type: "stock-warning",
+          title: "Lỗi đồng bộ đám mây",
+          message: `Không thể lưu dữ liệu vào cơ sở dữ liệu PostgreSQL: ${error?.message || "Lỗi kết nối máy chủ backend"}.`
+        });
+      }
+      return false;
     } finally {
-      setIsSyncingAll(false);
+      if (!silent) setIsSyncingAll(false);
     }
   };
 
@@ -1245,9 +1899,24 @@ export default function App() {
 
     const tenantId = trialInfo?.id || "demo";
     try {
-      const res = await fetch(`/api/kiot/load/${tenantId}`);
+      let res: Response | null = null;
+      let lastErr: any = null;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          res = await fetch(`/api/kiot/load/${tenantId}`);
+          if (res) break;
+        } catch (fetchErr) {
+          lastErr = fetchErr;
+          if (attempt < 3) await new Promise((r) => setTimeout(r, 800 * attempt));
+        }
+      }
+
+      if (!res) {
+        throw new Error(lastErr?.message === "Failed to fetch" ? "Kết nối mạng hoặc máy chủ bị gián đoạn (Failed to fetch)." : (lastErr?.message || "Không thể tải dữ liệu từ máy chủ."));
+      }
+
       if (!res.ok) {
-        throw new Error("Không thể tải dữ liệu từ PostgreSQL.");
+        throw new Error("Không thể tải dữ liệu từ PostgreSQL (Mã lỗi " + res.status + ").");
       }
       const data = await res.json();
       
@@ -1283,52 +1952,163 @@ export default function App() {
     }
   };
 
-  // Periodic automatic sync helper (runs in background every 60 seconds if enabled and online)
+  // 5b. Real-Time Cross-Device Sync Engine (Initial safe pull/push & Periodic background sync)
   useEffect(() => {
-    if (!autoSyncEnabled || !isOnline || products.length === 0) return;
+    if (!isOnline) return;
+    const tenantId = trialInfo?.id || "demo";
 
-    const interval = setInterval(() => {
-      const runSilentSync = async () => {
-        try {
-          const tenantId = trialInfo?.id || "demo";
-          await fetch(`/api/kiot/sync/${tenantId}`, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json"
-            },
-            body: JSON.stringify({
-              products,
-              categories,
-              customers,
-              suppliers,
-              invoices,
-              staff,
-              settings,
-              audits,
-              purchaseOrders,
-              cashbook,
-              projects,
-              systemLogs
-            })
-          });
+    const getLocalData = <T,>(key: string): T[] => {
+      const str = localStorage.getItem(getDynamicKey(key));
+      if (!str) return [];
+      try { return JSON.parse(str); } catch (e) { return []; }
+    };
+
+    const mergeLists = <T extends { id: string | number }>(localList: T[], serverList: T[]): T[] => {
+      if (!serverList || serverList.length === 0) return localList || [];
+      if (!localList || localList.length === 0) return serverList || [];
+      const mergedMap = new Map<string | number, T>();
+      // Insert server items first
+      serverList.forEach(item => { if (item && item.id) mergedMap.set(item.id, item); });
+      // Overlay with local items (local represents newer state from this active session)
+      localList.forEach(item => { if (item && item.id) mergedMap.set(item.id, item); });
+      return Array.from(mergedMap.values());
+    };
+
+    const syncState = async (isInitial = false) => {
+      if (isSyncingRef.current || isSyncingAllRef.current) {
+        console.log("[Cross-Device Sync] Skipping background sync pull because a sync/push is actively running...");
+        return;
+      }
+      try {
+        console.log(`[Cross-Device Sync] Synchronizing tenant ${tenantId}...`);
+        const res = await fetch(`/api/kiot/load/${tenantId}`);
+        if (!res.ok) throw new Error("Load failed");
+        
+        const data = await res.json();
+        const hasCloudData = (data.products && data.products.length > 0) || 
+                             (data.invoices && data.invoices.length > 0) ||
+                             (data.customers && data.customers.length > 0) ||
+                             (data.settings && data.settings.shopName);
+
+        const localProducts = getLocalData<Product>("products");
+        const localCategories = getLocalData<Category>("categories");
+        const localCustomers = getLocalData<Customer>("customers");
+        const localSuppliers = getLocalData<Supplier>("suppliers");
+        const localInvoices = getLocalData<Invoice>("invoices");
+        const localAudits = getLocalData<InventoryAudit>("audits");
+        const localStaff = getLocalData<Staff>("staff");
+        const localPurchaseOrders = getLocalData<PurchaseOrder>("purchase_orders");
+        const localCashbook = getLocalData<CashbookEntry>("cashbook");
+        const localProjects = getLocalData<Project>("projects");
+        const localSystemLogs = getLocalData<SystemAuditLog>("system_logs");
+        
+        if (hasCloudData) {
+          // Cloud has data. Let's load or merge it safely!
+          if (data.products) {
+            const merged = mergeLists(localProducts, data.products);
+            setProducts(merged);
+            localStorage.setItem(getDynamicKey("products"), JSON.stringify(merged));
+          }
+          if (data.categories) {
+            const merged = mergeLists(localCategories, data.categories);
+            setCategories(merged);
+            localStorage.setItem(getDynamicKey("categories"), JSON.stringify(merged));
+          }
+          if (data.customers) {
+            const merged = mergeLists(localCustomers, data.customers);
+            setCustomers(merged);
+            localStorage.setItem(getDynamicKey("customers"), JSON.stringify(merged));
+          }
+          if (data.suppliers) {
+            const merged = mergeLists(localSuppliers, data.suppliers);
+            setSuppliers(merged);
+            localStorage.setItem(getDynamicKey("suppliers"), JSON.stringify(merged));
+          }
+          if (data.invoices) {
+            const merged = mergeLists(localInvoices, data.invoices);
+            setInvoices(merged);
+            localStorage.setItem(getDynamicKey("invoices"), JSON.stringify(merged));
+          }
+          if (data.audits) {
+            const merged = mergeLists(localAudits, data.audits);
+            setAudits(merged);
+            localStorage.setItem(getDynamicKey("audits"), JSON.stringify(merged));
+          }
+          if (data.staff) {
+            const merged = mergeLists(localStaff, data.staff);
+            setStaff(merged);
+            localStorage.setItem(getDynamicKey("staff"), JSON.stringify(merged));
+          }
+          if (data.settings) {
+            setSettings(data.settings);
+            localStorage.setItem(getDynamicKey("settings"), JSON.stringify(data.settings));
+            document.title = data.settings.shopName;
+          }
+          if (data.purchaseOrders) {
+            const merged = mergeLists(localPurchaseOrders, data.purchaseOrders);
+            setPurchaseOrders(merged);
+            localStorage.setItem(getDynamicKey("purchase_orders"), JSON.stringify(merged));
+          }
+          if (data.cashbook) {
+            const merged = mergeLists(localCashbook, data.cashbook);
+            setCashbook(merged);
+            localStorage.setItem(getDynamicKey("cashbook"), JSON.stringify(merged));
+          }
+          if (data.projects) {
+            const merged = mergeLists(localProjects, data.projects);
+            setProjects(merged);
+            localStorage.setItem(getDynamicKey("projects"), JSON.stringify(merged));
+          }
+          if (data.systemLogs) {
+            const merged = mergeLists(localSystemLogs, data.systemLogs);
+            setSystemLogs(merged);
+            localStorage.setItem(getDynamicKey("system_logs"), JSON.stringify(merged));
+          }
+          
           const nowStr = new Date().toISOString();
           setLastSyncTime(nowStr);
           localStorage.setItem("kiot_last_sync_time", nowStr);
-          console.log("KiotX: Background PostgreSQL auto-sync successfully run.");
-        } catch (err) {
-          console.warn("KiotX: Background PostgreSQL auto-sync error:", err);
+          
+          if (isInitial) {
+            safeDispatchEvent("kiot-toast", {
+              type: "success",
+              title: "Đồng bộ đám mây thành công! 🌐",
+              message: "Cửa hàng của bạn đã được kết nối và tải toàn bộ dữ liệu đồng bộ thời gian thực từ đám mây."
+            });
+          }
+        } else if (isInitial && localProducts.length > 0) {
+          // Cloud has NO data but local HAS data: automatically upload to initialize cloud!
+          console.log(`[Cross-Device Sync] Cloud is empty but local has data. Uploading local state...`);
+          await triggerSyncAll(undefined, true);
         }
-      };
-      runSilentSync();
-    }, 60000);
+      } catch (err) {
+        console.warn("[Cross-Device Sync] Background sync helper error:", err);
+      }
+    };
 
-    return () => clearInterval(interval);
-  }, [autoSyncEnabled, isOnline, products, invoices, customers, settings, suppliers, purchaseOrders, cashbook, projects, trialInfo, staff]);
+    // Initial sync
+    const timeout = setTimeout(() => syncState(true), 1500);
+
+    // Periodic check every 30 seconds
+    const interval = setInterval(() => {
+      if (autoSyncEnabled) {
+        syncState(false);
+      }
+    }, 30000);
+
+    return () => {
+      clearTimeout(timeout);
+      clearInterval(interval);
+    };
+  }, [trialInfo, isOnline, autoSyncEnabled]);
 
   // 6. Database Mutation Handlers
   const handleAddInvoice = (newInv: Invoice) => {
     const updatedInvoices = [newInv, ...invoices];
-    saveInvoices(updatedInvoices);
+    
+    // Save invoices locally
+    setInvoices(updatedInvoices);
+    localStorage.setItem(getDynamicKey("invoices"), JSON.stringify(updatedInvoices));
 
     const matchedCustomer = newInv.customerId ? customers.find(c => c.id === newInv.customerId) : null;
     const customerEmail = matchedCustomer?.email;
@@ -1410,8 +2190,9 @@ export default function App() {
     }
 
     // If customer is attached, accumulate totalSpent and points, update tier
+    let updatedCustomers = customers;
     if (newInv.customerId) {
-      const updatedCustomers = customers.map(c => {
+      updatedCustomers = customers.map(c => {
         if (c.id === newInv.customerId) {
           const newSpent = c.totalSpent + newInv.totalPayable;
           const newPoints = c.points + newInv.pointsEarned;
@@ -1429,10 +2210,13 @@ export default function App() {
         }
         return c;
       });
-      saveCustomers(updatedCustomers);
+      // Save customers locally
+      setCustomers(updatedCustomers);
+      localStorage.setItem(getDynamicKey("customers"), JSON.stringify(updatedCustomers));
     }
 
     // Automatically record sales income in cashbook if paid immediately
+    let updatedCashbook = cashbook;
     if (newInv.paymentMethod === "CASH" || newInv.paymentMethod === "BANK_TRANSFER" || newInv.paymentMethod === "CREDIT_CARD") {
       const cashbookMethod = newInv.paymentMethod === "BANK_TRANSFER" ? "BANK_TRANSFER" : "CASH";
       const newEntry: CashbookEntry = {
@@ -1446,7 +2230,19 @@ export default function App() {
         date: newInv.date,
         creatorName: newInv.cashierName || "Hệ thống"
       };
-      saveCashbook([newEntry, ...cashbook]);
+      updatedCashbook = [newEntry, ...cashbook];
+      // Save cashbook locally
+      setCashbook(updatedCashbook);
+      localStorage.setItem(getDynamicKey("cashbook"), JSON.stringify(updatedCashbook));
+    }
+
+    // Trigger ONE SINGLE synchronized database backup to PostgreSQL containing all local overrides!
+    if (isOnline && autoSyncEnabled) {
+      triggerSyncAll({
+        invoices: updatedInvoices,
+        customers: updatedCustomers,
+        cashbook: updatedCashbook
+      }, true);
     }
   };
 
@@ -1496,7 +2292,10 @@ export default function App() {
     };
 
     const updatedInvoices = invoices.map(inv => inv.id === invoiceId ? cancelledInv : inv);
-    saveInvoices(updatedInvoices);
+    
+    // Save invoices locally
+    setInvoices(updatedInvoices);
+    localStorage.setItem(getDynamicKey("invoices"), JSON.stringify(updatedInvoices));
 
     // 2. Restore Inventory (Hoàn kho)
     const updatedProducts = products.map(p => {
@@ -1509,11 +2308,27 @@ export default function App() {
       }
       return p;
     });
-    saveProducts(updatedProducts);
+
+    // Notify components that stock was modified to refresh views
+    if (products.length === updatedProducts.length) {
+      updatedProducts.forEach((p, idx) => {
+        if (p.stock !== products[idx].stock) {
+          safeDispatchEvent("kiot-product-stock-change", {
+            productId: p.id,
+            newStock: p.stock
+          });
+        }
+      });
+    }
+
+    // Save products locally
+    setProducts(updatedProducts);
+    localStorage.setItem(getDynamicKey("products"), JSON.stringify(updatedProducts));
 
     // 3. Revert Customer values (Dòng khách hàng)
+    let updatedCustomers = customers;
     if (targetInvoice.customerId) {
-      const updatedCustomers = customers.map(c => {
+      updatedCustomers = customers.map(c => {
         if (c.id === targetInvoice.customerId) {
           const newSpent = Math.max(0, c.totalSpent - targetInvoice.totalPayable);
           const newPoints = Math.max(0, c.points - targetInvoice.pointsEarned);
@@ -1532,7 +2347,9 @@ export default function App() {
         }
         return c;
       });
-      saveCustomers(updatedCustomers);
+      // Save customers locally
+      setCustomers(updatedCustomers);
+      localStorage.setItem(getDynamicKey("customers"), JSON.stringify(updatedCustomers));
     }
 
     // 4. Reverse Cashbook flow (Đảo dòng tiền)
@@ -1551,7 +2368,9 @@ export default function App() {
         creatorName: cancelledBy
       };
       updatedCashbookList = [newEntry, ...cashbook];
-      saveCashbook(updatedCashbookList);
+      // Save cashbook locally
+      setCashbook(updatedCashbookList);
+      localStorage.setItem(getDynamicKey("cashbook"), JSON.stringify(updatedCashbookList));
     }
 
     // 5. Cloud/Sync backups if online and auto-sync is enabled
@@ -1581,15 +2400,9 @@ export default function App() {
 
       // Sync updated customer if any
       if (targetInvoice.customerId) {
-        const cust = customers.find(c => c.id === targetInvoice.customerId);
+        const cust = updatedCustomers.find(c => c.id === targetInvoice.customerId);
         if (cust) {
-          const updatedCust = {
-            ...cust,
-            totalSpent: Math.max(0, cust.totalSpent - targetInvoice.totalPayable),
-            points: Math.max(0, cust.points - targetInvoice.pointsEarned),
-            debt: targetInvoice.paymentMethod === "DEBT" ? Math.max(0, (cust.debt || 0) - targetInvoice.totalPayable) : (cust.debt || 0)
-          };
-          safeSetDoc(doc(db, "kiot_customers", cust.id), updatedCust).catch(err => {
+          safeSetDoc(doc(db, "kiot_customers", cust.id), cust).catch(err => {
             console.error("Lỗi đồng bộ khách hàng hoàn điểm lên Firestore:", err);
           });
         }
@@ -1602,6 +2415,14 @@ export default function App() {
           console.error("Lỗi đồng bộ phiếu chi hoàn tiền lên Firestore:", err);
         });
       }
+
+      // Single consolidated backup sync to PostgreSQL
+      triggerSyncAll({
+        invoices: updatedInvoices,
+        products: updatedProducts,
+        customers: updatedCustomers,
+        cashbook: updatedCashbookList
+      }, true);
     }
 
     // Dispatch custom event for a beautiful toast
@@ -1833,12 +2654,17 @@ export default function App() {
     let deletedInvoicesCount = 0;
     let deletedCashbookCount = 0;
 
+    let updatedInvoices = invoices;
+    let updatedCashbook = cashbook;
+
     if (type === "invoices" || type === "all") {
       const originalLen = invoices.length;
       const matchedInvs = invoices.filter(inv => isMatch(inv.date));
-      const remainingInvoices = invoices.filter(inv => !isMatch(inv.date));
-      deletedInvoicesCount = originalLen - remainingInvoices.length;
-      saveInvoices(remainingInvoices);
+      updatedInvoices = invoices.filter(inv => !isMatch(inv.date));
+      deletedInvoicesCount = originalLen - updatedInvoices.length;
+      
+      setInvoices(updatedInvoices);
+      localStorage.setItem(getDynamicKey("invoices"), JSON.stringify(updatedInvoices));
 
       // Delete from Firestore if online
       if (isOnline) {
@@ -1853,9 +2679,11 @@ export default function App() {
     if (type === "cashbook" || type === "all") {
       const originalLen = cashbook.length;
       const matchedEntries = cashbook.filter(entry => isMatch(entry.date));
-      const remainingCashbook = cashbook.filter(entry => !isMatch(entry.date));
-      deletedCashbookCount = originalLen - remainingCashbook.length;
-      saveCashbook(remainingCashbook);
+      updatedCashbook = cashbook.filter(entry => !isMatch(entry.date));
+      deletedCashbookCount = originalLen - updatedCashbook.length;
+      
+      setCashbook(updatedCashbook);
+      localStorage.setItem(getDynamicKey("cashbook"), JSON.stringify(updatedCashbook));
 
       // Delete from Firestore if online
       if (isOnline) {
@@ -1865,6 +2693,14 @@ export default function App() {
           });
         });
       }
+    }
+
+    // Unified Cloud Sync to PostgreSQL (Cloud SQL)
+    if (isOnline && autoSyncEnabled) {
+      triggerSyncAll({
+        invoices: updatedInvoices,
+        cashbook: updatedCashbook
+      }, true);
     }
 
     safeDispatchEvent("kiot-toast", {
@@ -1897,7 +2733,6 @@ export default function App() {
   if (!currentStaff) {
     return (
       <KiotLogin
-        staffList={staff}
         onSelectStaff={handleSelectSimulatedStaff}
         onGoogleLogin={handleGoogleLogin}
         isSyncing={isSyncing}
@@ -2025,7 +2860,7 @@ export default function App() {
                 return (
                   <button
                     key={item.id}
-                    onClick={() => setActiveTab(item.id)}
+                    onClick={() => handleTabChange(item.id)}
                     className={`w-full p-3 rounded-xl flex items-center justify-between transition-all text-left relative cursor-pointer group ${
                       isActive 
                         ? item.highlight 
@@ -2077,7 +2912,7 @@ export default function App() {
 
           {/* Sidebar Footer Controls */}
           <div className="space-y-3.5 pt-6 border-t border-stone-850/60">
-            {/* Quick Theme Toggle & Database cleaner */}
+            {/* Quick Theme Toggle (Fully centered without Reset DB button for cleaner safety) */}
             <div className="flex items-center justify-between px-1">
               <button
                 onClick={handleToggleTheme}
@@ -2091,13 +2926,9 @@ export default function App() {
                 {theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
               </button>
 
-              <button
-                onClick={handleResetDatabase}
-                className="px-3.5 py-2 rounded-lg bg-stone-950 hover:bg-rose-950/40 border border-stone-850 hover:border-rose-900 text-stone-500 hover:text-rose-400 text-[10px] font-bold uppercase tracking-wider transition-all cursor-pointer"
-                title="Khôi phục dữ liệu demo ban đầu"
-              >
-                Reset DB
-              </button>
+              <span className="text-[9px] font-mono text-stone-600 uppercase tracking-widest">
+                KiotX SaaS Secure
+              </span>
             </div>
 
             {/* Active Cashier Card */}
@@ -2179,47 +3010,97 @@ export default function App() {
 
             {/* Real-time clocks, status, and AI trigger */}
             <div className="flex flex-wrap items-center justify-end gap-3">
-              {/* Connection Status & Simulation Switcher */}
-              <button
-                onClick={() => {
-                  const targetState = !isOnline;
-                  setIsOnline(targetState);
-                  if (!targetState) {
-                    safeDispatchEvent("kiot-toast", {
-                      type: "stock-warning",
-                      title: "Đã ngắt kết nối mạng",
-                      message: "Thiết bị chuyển sang chế độ ngoại tuyến (Offline). Bạn vẫn có thể tiếp tục bán hàng bình thường."
-                    });
-                  } else {
-                    safeDispatchEvent("kiot-toast", {
-                      type: "success",
-                      title: "Đã khôi phục kết nối",
-                      message: "Thiết bị kết nối trực tuyến trở lại. Hệ thống sẽ tự động đồng bộ hóa hóa đơn."
-                    });
-                  }
-                }}
-                disabled={isSyncing}
-                className={`px-3 py-1.5 rounded-xl border text-xs font-bold uppercase tracking-wider flex items-center gap-2 transition-all cursor-pointer ${
+              {/* Connection Status & Simulation Switcher (Modern Sliding Toggle Switch) */}
+              <div 
+                className={`px-3 py-1.5 rounded-xl border flex items-center gap-2.5 transition-all select-none ${
                   isOnline 
-                    ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20 hover:bg-emerald-500/15" 
-                    : "bg-amber-500/10 text-amber-500 border-amber-500/35 hover:bg-amber-500/15"
+                    ? "bg-emerald-500/5 border-emerald-500/20 text-emerald-400" 
+                    : !isRealOnline 
+                      ? "bg-rose-500/5 border-rose-500/20 text-rose-400"
+                      : "bg-stone-900 border-stone-850 text-stone-400"
                 }`}
-                title={isOnline ? "Bấm để mô phỏng ngắt kết nối mạng (Bán hàng Offline)" : "Bấm để mô phỏng kết nối mạng trực tuyến (Tự đồng bộ)"}
+                title={isOnline ? "Bấm công tắc để ngắt kết nối mạng (Bán hàng Offline)" : "Bấm công tắc để kết nối mạng trực tuyến (Tự đồng bộ)"}
               >
-                {isSyncing ? (
-                  <RefreshCw className="h-3.5 w-3.5 animate-spin text-emerald-400" />
-                ) : isOnline ? (
-                  <Wifi className="h-3.5 w-3.5 text-emerald-400" />
-                ) : (
-                  <WifiOff className="h-3.5 w-3.5 text-amber-500 animate-pulse" />
-                )}
-                <span>{isSyncing ? "Đang đồng bộ..." : isOnline ? "Trực tuyến" : "Ngoại tuyến (Offline)"}</span>
-                {offlineQueue.length > 0 && (
-                  <span className="ml-1 bg-amber-500 text-stone-950 text-[10px] px-1.5 py-0.5 rounded font-mono font-black animate-bounce">
-                    {offlineQueue.length}
-                  </span>
-                )}
-              </button>
+                <span className="text-[10px] font-bold uppercase tracking-wider text-stone-500">Mạng (Wi-Fi):</span>
+                
+                {/* Simulated Switch Widget */}
+                <button
+                  type="button"
+                  disabled={isSyncing}
+                  onClick={() => {
+                    const targetState = !isOnline;
+                    if (targetState) {
+                      if (!isRealOnline) {
+                        safeDispatchEvent("kiot-toast", {
+                          type: "stock-warning",
+                          title: "Không thể kết nối trực tuyến 📡",
+                          message: "Thiết bị thực tế của bạn hiện đang mất tín hiệu Wi-Fi hoặc không có kết nối Internet!"
+                        });
+                        return;
+                      }
+                      setIsManualOffline(false);
+                      localStorage.setItem("kiot_manual_offline", "false");
+                      setIsOnline(true);
+                      safeDispatchEvent("kiot-toast", {
+                        type: "success",
+                        title: "Chuyển sang Trực tuyến ✅",
+                        message: "Đã bật kết nối mạng. Hệ thống tự động đồng bộ hóa hóa đơn và dữ liệu lên máy chủ đám mây."
+                      });
+                    } else {
+                      setIsManualOffline(true);
+                      localStorage.setItem("kiot_manual_offline", "true");
+                      setIsOnline(false);
+                      safeDispatchEvent("kiot-toast", {
+                        type: "stock-warning",
+                        title: "Chuyển sang Ngoại tuyến ⛔",
+                        message: "Bạn đã chủ động tắt kết nối mạng. Dữ liệu bán hàng sẽ được lưu tạm tại trình duyệt."
+                      });
+                    }
+                  }}
+                  className={`w-9 h-5 rounded-full p-0.5 transition-colors relative flex items-center cursor-pointer ${
+                    isOnline ? "bg-emerald-500/40 border border-emerald-500/30" : "bg-stone-800 border border-stone-700"
+                  }`}
+                >
+                  <div 
+                    className={`w-3.5 h-3.5 rounded-full transition-transform duration-200 shadow-md ${
+                      isOnline 
+                        ? "translate-x-4 bg-emerald-400" 
+                        : "translate-x-0 bg-stone-500"
+                    }`} 
+                  />
+                </button>
+
+                {/* Status Indicator text and count */}
+                <div className="flex items-center gap-1.5 text-[10px] font-black uppercase tracking-wider font-sans">
+                  {isSyncing ? (
+                    <span className="flex items-center gap-1 text-emerald-400">
+                      <RefreshCw className="h-3 w-3 animate-spin" />
+                      <span>Đồng bộ...</span>
+                    </span>
+                  ) : isOnline ? (
+                    <span className="text-emerald-400 flex items-center gap-1">
+                      <Wifi className="h-3 w-3 animate-pulse" />
+                      <span>Trực tuyến</span>
+                    </span>
+                  ) : !isRealOnline ? (
+                    <span className="text-rose-400 flex items-center gap-1 animate-pulse">
+                      <WifiOff className="h-3 w-3 text-rose-400" />
+                      <span>Mất Wi-Fi máy thật 📡</span>
+                    </span>
+                  ) : (
+                    <span className="text-stone-400 flex items-center gap-1">
+                      <WifiOff className="h-3 w-3 text-stone-500" />
+                      <span>Ngoại tuyến (Tắt)</span>
+                    </span>
+                  )}
+
+                  {offlineQueue.length > 0 && (
+                    <span className="bg-amber-500 text-stone-950 text-[9px] px-1.5 py-0.5 rounded font-mono font-black animate-bounce shrink-0 ml-1">
+                      {offlineQueue.length}
+                    </span>
+                  )}
+                </div>
+              </div>
 
               <div className={`px-3 py-1.5 rounded-xl border font-mono text-xs flex items-center gap-2 ${
                 theme === "dark" ? "bg-stone-950 border-stone-850 text-stone-300" : "bg-stone-100 border-stone-200 text-stone-700"
@@ -2375,7 +3256,7 @@ export default function App() {
                       currentStaff={currentStaff!}
                       staffList={staff}
                       systemLogs={systemLogs}
-                      onNavigateToTab={setActiveTab}
+                      onNavigateToTab={handleTabChange}
                       onCancelInvoice={handleCancelInvoice}
                       onUpdateInvoice={handleUpdateInvoice}
                       customers={customers}
@@ -2391,9 +3272,13 @@ export default function App() {
                       customers={customers}
                       settings={settings}
                       suppliers={suppliers}
+                      currentStaff={currentStaff!}
                       onAddInvoice={handleAddInvoice}
                       onAddCustomer={(newC) => saveCustomers([newC, ...customers])}
                       onUpdateProductStock={handleUpdateProductStock}
+                      isOnline={isOnline}
+                      isRealOnline={isRealOnline}
+                      offlineQueueCount={offlineQueue.length}
                     />
                   )}
 
@@ -2503,20 +3388,26 @@ export default function App() {
                       onAddStaff={(newS) => saveStaff([...staff, newS])}
                       onUpdateStaff={(editS) => saveStaff(staff.map(s => s.id === editS.id ? editS : s))}
                       onDeleteStaff={(delId) => saveStaff(staff.filter(s => s.id !== delId))}
+                      trialInfo={trialInfo}
+                      onUpdateTrialPassword={handleUpdateTrialPassword}
                       products={products}
                       categories={categories}
                       customers={customers}
                       suppliers={suppliers}
                       invoices={invoices}
                       audits={audits}
+                      systemLogs={systemLogs}
                       onRestoreBackup={handleRestoreBackup}
                       onRestoreFromPostgres={handleRestoreFromPostgres}
+                      onResetDatabase={handleResetDatabase}
                       isOnline={isOnline}
                       isSyncingAll={isSyncingAll}
                       triggerSyncAll={triggerSyncAll}
                       lastSyncTime={lastSyncTime}
                       autoSyncEnabled={autoSyncEnabled}
                       onToggleAutoSync={handleToggleAutoSync}
+                      integrityStatus={integrityStatus}
+                      runChecksumValidation={runChecksumValidation}
                     />
                   )}
 
@@ -2528,6 +3419,9 @@ export default function App() {
                       onSetTrialExpirationDate={handleSetTrialExpirationDate}
                       onDeleteTrial={handleDeleteTrial}
                       onUpdateTrialPassword={handleUpdateTrialPassword}
+                      onUpdateTrialAllowedModules={handleUpdateTrialAllowedModules}
+                      onResetDatabase={handleResetDatabase}
+                      onCreateTrial={handleCreateTrial}
                     />
                   )}
                 </motion.div>
@@ -2618,7 +3512,7 @@ export default function App() {
                     Quản Lý & Phục Hồi Dữ Liệu
                   </h3>
                   <p className="text-xs text-stone-400">
-                    Cửa hàng: <span className="text-stone-200 font-bold">{trialInfo?.shopName || "KiotX Demo Store"}</span>
+                    Cửa hàng: <span className="text-stone-200 font-bold">{trialInfo?.shopName || (currentStaff?.email?.toLowerCase() === "congbaotruong8@gmail.com" ? "Hệ thống Chính KiotX (Super Admin)" : "KiotX Main Store")}</span>
                   </p>
                 </div>
               </div>

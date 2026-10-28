@@ -263,15 +263,15 @@ export const DEFAULT_STAFF: Staff[] = [
 ];
 
 export const DEFAULT_SETTINGS: ShopSetting = {
-  shopName: "Cửa hàng Tiện lợi Trương Gia Phát",
+  shopName: "Cửa hàng Tiện lợi KiotX",
   address: "Phường Đại Quang, TP. Dĩ An",
   phone: "090.888.9999",
   logoUrl: "https://images.unsplash.com/photo-1578916171728-46686eac8d58?auto=format&fit=crop&w=150&q=80",
   taxRate: 8, // 8% VAT
   currency: "VND",
   zaloNumber: "0908889999",
-  seoTitle: "Cửa hàng Tiện lợi Trương Gia Phát | Bách hóa bỉm sữa đồ gia dụng Dĩ An",
-  seoKeywords: "bach hoa truong gia phat, cua hang tien loi di an, tạp hóa tiện lợi, kiotx",
+  seoTitle: "Cửa hàng Tiện lợi KiotX | Bách hóa bỉm sữa đồ gia dụng",
+  seoKeywords: "bach hoa tien loi, cua hang tien loi, tạp hóa tiện lợi, kiotx",
   reportDeletePassword: "admin123",
   bankName: "MB",
   bankAccount: "7919399999",
@@ -280,10 +280,19 @@ export const DEFAULT_SETTINGS: ShopSetting = {
   eInvoiceProvider: "MOCK",
   eInvoiceTaxCode: "3701548239",
   eInvoiceApiUrl: "https://api.meinvoice.vn/v1/integration",
-  eInvoiceUsername: "truonggiaphat.corp",
+  eInvoiceUsername: "kiotx.corp",
   eInvoicePassword: "••••••••••••",
   eInvoicePattern: "1C26TML",
-  eInvoiceSerial: "C26TGP"
+  eInvoiceSerial: "C26KTX",
+  printerPaperSize: "K80",
+  printerAutoPrint: false,
+  printerHeaderNote: "Trân trọng cảm ơn quý khách!",
+  printerFooterNote: "Cảm ơn quý khách & Hẹn gặp lại!",
+  printerShowBarcode: true,
+  printerShowLogo: true,
+  printerConnectionType: "SYSTEM",
+  printerIPAddress: "192.168.1.100",
+  printerDeviceName: "Xprinter XP-420B"
 };
 
 export const DEFAULT_AUDITS: InventoryAudit[] = [

@@ -5,10 +5,8 @@ import fs from "fs";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
 import nodemailer from "nodemailer";
-import { db } from "./src/db/index.ts";
+import { db, pool, executeWithRetry } from "./src/db/index.ts";
 import {
-  posts,
-  users,
   trials,
   products as productsTable,
   categories as categoriesTable,
@@ -24,22 +22,28 @@ import {
   cashShiftsTable,
   systemLogsTable
 } from "./src/db/schema.ts";
-import { eq, desc, sql } from "drizzle-orm";
-import { requireAuth, AuthRequest } from "./src/middleware/auth.ts";
-import { getOrCreateUser } from "./src/db/users.ts";
+import { eq, sql } from "drizzle-orm";
 
 async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  app.use(express.json());
+  app.use(express.json({ limit: "50mb" }));
+  app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
-  // Ensure all trials have a password (update null or empty passwords to '123456' on startup)
+  // Ensure database schema migrations and required columns exist
   try {
-    await db.execute(sql`UPDATE trials SET password = '123456' WHERE password IS NULL OR password = '' OR password = '(Trống)'`);
-    console.log("[Server Startup] Synchronized empty SaaS trial passwords to default '123456' successfully.");
+    await executeWithRetry(() => pool.query("ALTER TABLE trials ADD COLUMN IF NOT EXISTS allowed_modules jsonb"));
+    console.log("[Server Startup] Added allowed_modules column to trials table if missing.");
+  } catch (alterErr: any) {
+    console.error("[Server Startup ERROR] Failed to alter trials table:", alterErr);
+  }
+
+  try {
+    await executeWithRetry(() => pool.query("UPDATE trials SET password = '123456' WHERE password IS NULL OR password = '' OR password = '(Trống)'"));
+    console.log("[Server Startup] Synchronized empty SaaS trial passwords successfully.");
   } catch (err: any) {
-    console.warn("[Server Startup Warning] Could not check or update empty SaaS trial passwords:", err);
+    console.warn("[Server Startup Warning] Database password sync note:", err);
   }
 
   // Initialize Gemini safely
@@ -72,15 +76,13 @@ async function startServer() {
       }
 
       if (!ai) {
-        // High quality Vietnamese simulated consultant fallback in case API key is not ready
         const fallbacks = [
-          "Xin chào! Tôi là kiến trúc sư Minh Khôi đến từ Công ty TNHH Thiết Kế & Thi Công Nội Thất Trương Gia Phát (MST: 3703472033). Rất vui được trò chuyện cùng bạn. Bạn đang cần thi công trần thạch cao hay vách nhựa Composite/PVC vân đá cẩm thạch?",
-          "Để tối ưu chi phí và nâng tầm sang trọng, combo trần thạch cao chống ẩm giật cấp kết hợp hệ thống đèn LED âm rãnh hắt sáng đang là xu hướng bán chạy nhất tại Trương Gia Phát!",
-          "Trương Gia Phát sở hữu nguồn vật liệu nhựa giả gỗ Composite sọc lam sóng và vách PVC vân đá cẩm thạch chất lượng cao. Thi công bền bỉ chống ẩm mốc 100%, bảo hành 3 năm và hỗ trợ chu đáo.",
-          "Bạn có thể dùng ngay công cụ 'Dự toán chi phí thông minh' hoặc tham khảo mục 'Gợi ý sở thích vật liệu' trên website này để khám phá phương án tối ưu nhất nhé!"
+          "Xin chào! Tôi là KiotX AI Co-Pilot — Trợ lý vận hành cửa hàng thông minh của bạn. Bạn cần phân tích doanh thu, tồn kho hay sổ quỹ hôm nay?",
+          "Để tối ưu lợi nhuận, bạn có thể kiểm tra ngay danh sách các sản phẩm sắp hết kho trong tab Hàng hóa và lập phiếu nhập hàng kịp thời.",
+          "Hệ thống KiotX hỗ trợ đồng bộ hóa đơn thời gian thực, quản lý công nợ đối tác và báo cáo lãi lỗ chi tiết theo từng ngày."
         ];
         const randomAnswer = fallbacks[Math.floor(Math.random() * fallbacks.length)];
-        return res.json({ text: randomAnswer + " (Phản hồi từ KTS Trương Gia Phát - Hãy cấu hình GEMINI_API_KEY để bật AI thông minh)" });
+        return res.json({ text: randomAnswer + " (Hãy cấu hình GEMINI_API_KEY để bật KiotX AI Co-Pilot thông minh)" });
       }
 
       // Format messages for the new @google/genai format
@@ -98,48 +100,20 @@ async function startServer() {
         parts: [{ text: message }]
       });
 
-      // Adaptive System Instructions based on User Role (Admin/Staff vs. Guest)
-      let systemInstruction = "";
-      const isAdmin = userRole === "OWNER" || userRole === "MANAGER" || userRole === "CASHIER";
-
-      if (isAdmin) {
-        systemInstruction = `Bạn là KiotX AI Co-Pilot — Trợ lý phân tích kinh doanh, dự báo doanh thu và quản trị tối ưu hóa cửa hàng thông minh dành riêng cho nhà quản trị ${userName || ""}.
+      const systemInstruction = `Bạn là KiotX AI Co-Pilot — Trợ lý phân tích kinh doanh, dự báo doanh thu và quản trị tối ưu hóa cửa hàng thông minh dành cho ${userName || "người dùng"} (Vai trò: ${userRole || "Nhân viên"}).
 Hãy luôn xưng hô lịch sự, thân thiện, khách quan, mang tính hỗ trợ cao và trả lời bằng tiếng Việt.
-Cửa hàng bạn đang hỗ trợ: CÔNG TY TNHH THIẾT KẾ & THI CÔNG NỘI THẤT TRƯƠNG GIA PHÁT (MST: 3703472033).
 
-Dưới đây là DỮ LIỆU HOẠT ĐỘNG THỰC TẾ trực tiếp từ cơ sở dữ liệu của cửa hàng ở phiên làm việc này. Hãy sử dụng dữ liệu thực tế này để phân tích và trả lời chính xác, trung thực các câu hỏi của người quản lý (về sản phẩm bán chạy, tồn kho, doanh thu hóa đơn, các khoản chi thu trong sổ quỹ, hay tiến độ các công trình/dự án thiết kế & thi công):
+Dưới đây là DỮ LIỆU HOẠT ĐỘNG THỰC TẾ trực tiếp từ cơ sở dữ liệu của cửa hàng ở phiên làm việc này. Hãy sử dụng dữ liệu thực tế này để phân tích và trả lời chính xác, trung thực các câu hỏi của người quản lý (về sản phẩm bán chạy, tồn kho, doanh thu hóa đơn, các khoản chi thu trong sổ quỹ):
 ${storeContext || "(Chưa đồng bộ được dữ liệu thực tế cửa hàng)"}
 
 Nhiệm vụ của bạn:
-1. Khi người quản trị hỏi về các số liệu như: Sản phẩm bán chạy nhất, tồn kho, doanh thu hóa đơn, quỹ thu chi, danh sách dự án thi công... hãy đọc kỹ thông tin ở phần dữ liệu thực tế phía trên để báo cáo và phân tích chính xác cho họ. Tuyệt đối không tự bịa ra thông tin giả định.
-2. Đưa ra các phân tích, cảnh báo và gợi ý kinh doanh thực tế (ví dụ: chỉ ra các sản phẩm sắp hết kho cần nhập thêm gấp, sản phẩm nào đang đóng góp doanh thu lớn, cảnh báo chi phí vận hành sổ quỹ nếu vượt mức an toàn, bám sát các dự án thi công còn chậm tiến độ hoặc chuẩn bị hoàn thành).
+1. Khi người dùng hỏi về các số liệu như: Sản phẩm bán chạy nhất, tồn kho, doanh thu hóa đơn, quỹ thu chi... hãy đọc kỹ thông tin ở phần dữ liệu thực tế phía trên để báo cáo và phân tích chính xác cho họ. Tuyệt đối không tự bịa ra thông tin giả định.
+2. Đưa ra các phân tích, cảnh báo và gợi ý kinh doanh thực tế (ví dụ: chỉ ra các sản phẩm sắp hết kho cần nhập thêm gấp, sản phẩm nào đang đóng góp doanh thu lớn, cảnh báo chi phí vận hành sổ quỹ nếu vượt mức an toàn).
 3. Đóng vai trò là một Co-Pilot phân tích quản trị cửa hàng xuất sắc, đưa ra giải pháp giúp cửa hàng tối ưu hóa doanh số và nâng cao biên lợi nhuận.
-4. QUAN TRỌNG: Câu trả lời cần ngắn gọn, cô đọng, súc tích (khoảng 3 đến tối đa 5 câu), chia dòng rõ ràng và dễ đọc trên màn hình điện thoại di động! Dùng gạch đầu dòng (bullet points) khi báo cáo số liệu để cực kỳ trực quan.`;
-      } else {
-        systemInstruction = `Bạn là KTS Minh Khôi - Chuyên gia tư vấn và thi công trần thạch cao, nhựa giả gỗ trần vách tại CÔNG TY TNHH THIẾT KẾ & THI CÔNG NỘI THẤT TRƯƠNG GIA PHÁT (MST: 3703472033).
-Hãy luôn trả lời bằng tiếng Việt lịch sự, thân thiện, chuyên nghiệp, truyền tải thông tin chính xác về doanh nghiệp.
-
-Thông tin chính thức của công ty Trương Gia Phát:
-- Tên công ty: CÔNG TY TNHH THIẾT KẾ & THI CÔNG NỘI THẤT TRƯƠNG GIA PHÁT
-- Mã số thuế: 3703472033
-- Trụ sở chính: số 11/DC1 Đường Bình Chuẩn 69, Tổ 35, Khu phố Bình Phước B, Phường An Phú, Thành phố Hồ Chí Minh, Việt Nam
-- Tài khoản ngân hàng (STK): 7919399999 - MB BANK (Chủ tài khoản: CÔNG TY TNHH THIẾT KẾ & THI CÔNG NỘI THẤT TRƯƠNG GIA PHÁT)
-- Email: noithattruonggiaphat@gmail.com
-- Hotline & Zalo: 090.123.4567
-
-Dữ liệu bổ sung trực tiếp từ cửa hàng:
-${storeContext || ""}
-
-Nhiệm vụ của bạn:
-1. Giải đáp thắc mắc về thiết kế thi công trần thạch cao (trần giật cấp LED, trần phẳng, trần thả) và ốp vách trần nhựa giả gỗ (lam sóng Composite, tấm phẳng Nano vân gỗ sồi/óc chó, PVC giả đá cẩm thạch luxury), chống thấm ẩm mốc, cách âm, khung xương thạch cao Vĩnh Tường chịu lực thăng bằng tốt.
-2. Nêu bật ưu điểm của Trương Gia Phát: Cam kết dùng khung xương Vĩnh Tường chính hãng (ALPHA, BASI) thăng bằng cực chuẩn, bảo hành 3 năm trần vách chống nứt mốc bong tróc, miễn phí 100% thiết kế bản vẽ phối cảnh 3D khi thi công thực tế trọn gói.
-3. Khi khách muốn báo giá, hãy khuyến khích họ nhập thông số diện tích m2 vào 'Bảng dự toán chi phí tự động' trên website của chúng tôi để bóc tách sơ bộ trong tích tắc, hoặc gọi điện/nhắn Zalo trực tiếp qua hotline 090.123.4567 để nhận hồ sơ báo giá bóc tách hoàn toàn miễn phí.
-4. Gợi ý khách trải nghiệm 'Trắc nghiệm phong cách' và 'Gợi ý sở thích vật liệu' trên website để tìm ra gu trần vách ưng ý nhất.
-QUAN TRỌNG: Hãy trả lời cô đọng, súc tích (khoảng 3 đến tối đa 5 câu), chia dòng rõ ràng và dễ đọc trên màn hình điện thoại di động! Tránh viết các đoạn văn dài dằng dặc không xuống dòng.`;
-      }
+4. QUAN TRỌNG: Câu trả lời cần ngắn gọn, cô đọng, súc tích (khoảng 3 đến tối đa 5 câu), chia dòng rõ ràng và dễ đọc! Dùng gạch đầu dòng (bullet points) khi báo cáo số liệu để trực quan.`;
 
       const response = await ai.models.generateContent({
-        model: "gemini-3.5-flash",
+        model: "gemini-2.5-flash",
         contents: contents,
         config: {
           systemInstruction: systemInstruction,
@@ -147,170 +121,21 @@ QUAN TRỌNG: Hãy trả lời cô đọng, súc tích (khoảng 3 đến tối 
         }
       });
 
-      const replyText = response.text || "Cảm ơn bạn đã liên hệ. Tôi đang kiểm tra lại thông tin bản vẽ. Bạn vui lòng nhắn trực tiếp qua nút Zalo hoặc gọi SĐT 090.123.4567 để tôi hỗ trợ tức thì nhé!";
+      const replyText = response.text || "Xin lỗi, tôi chưa thể phân tích dữ liệu lúc này. Vui lòng thử lại sau giây lát!";
       return res.json({ text: replyText });
 
     } catch (err) {
       console.error("Gemini server error:", err);
-      return res.json({ text: "Chào bạn! Tôi là KTS Minh Khôi. Hệ thống AI đang bận một chút, bạn vui lòng nhắn tin qua Zalo (090.123.4567) hoặc bấm nút Gọi điện để tôi trực tiếp tư vấn và gửi các mẫu thiết kế 3D mới nhất nhé!" });
+      return res.json({ text: "Hệ thống KiotX AI Co-Pilot đang bận xử lý dữ liệu, vui lòng thử lại sau giây lát!" });
     }
   });
 
-  // --- DATABASE-BACKED API ROUTES FOR TRUONG GIA PHAT POSTS ---
-
-  // Auth User Sync on Login
-  app.post("/api/auth/sync", requireAuth, async (req: AuthRequest, res) => {
-    try {
-      const userUid = req.user?.uid;
-      const userEmail = req.user?.email || "";
-      if (!userUid) {
-        return res.status(400).json({ error: "Missing user credentials" });
-      }
-      const dbUser = await getOrCreateUser(userUid, userEmail);
-      return res.json({ success: true, user: dbUser });
-    } catch (error: any) {
-      console.error("Auth sync error:", error);
-      return res.status(500).json({ error: error.message });
-    }
-  });
-
-  // Fetch all published posts (Publicly available)
-  app.get("/api/posts", async (req, res) => {
-    try {
-      const allPublished = await db.select()
-        .from(posts)
-        .where(eq(posts.isPublished, true))
-        .orderBy(desc(posts.createdAt));
-      return res.json(allPublished);
-    } catch (error: any) {
-      console.error("Fetch posts error:", error);
-      return res.status(500).json({ error: "Failed to fetch posts" });
-    }
-  });
-
-  // Fetch all posts (authenticated dashboard view)
-  app.get("/api/posts/all", requireAuth, async (req: AuthRequest, res) => {
-    try {
-      const allPosts = await db.select()
-        .from(posts)
-        .orderBy(desc(posts.createdAt));
-      return res.json(allPosts);
-    } catch (error: any) {
-      console.error("Fetch all posts error:", error);
-      return res.status(500).json({ error: "Failed to fetch all posts" });
-    }
-  });
-
-  // Create a new post (Admin only)
-  app.post("/api/posts", requireAuth, async (req: AuthRequest, res) => {
-    try {
-      const userUid = req.user?.uid;
-      if (!userUid) {
-        return res.status(401).json({ error: "Unauthorized" });
-      }
-      
-      const dbUserResult = await db.select().from(users).where(eq(users.uid, userUid));
-      if (dbUserResult.length === 0) {
-        return res.status(404).json({ error: "User profile not found. Please sync account first." });
-      }
-      const dbUser = dbUserResult[0];
-
-      const { title, content, excerpt, imageUrl, videoUrl, category, isPublished } = req.body;
-      if (!title || !content) {
-        return res.status(400).json({ error: "Tiêu đề và nội dung là bắt buộc" });
-      }
-
-      const newPost = await db.insert(posts)
-        .values({
-          title,
-          content,
-          excerpt: excerpt || "",
-          imageUrl: imageUrl || "https://images.unsplash.com/photo-1600585154340-be6161a56a0c?auto=format&fit=crop&w=800&q=80",
-          videoUrl: videoUrl || "",
-          category: category || "Tin tức",
-          authorId: dbUser.id,
-          isPublished: isPublished !== undefined ? isPublished : true,
-          createdAt: new Date(),
-          updatedAt: new Date(),
-        })
-        .returning();
-
-      return res.json(newPost[0]);
-    } catch (error: any) {
-      console.error("Create post error:", error);
-      return res.status(500).json({ error: error.message || "Failed to create post" });
-    }
-  });
-
-  // Update a post (Admin only)
-  app.put("/api/posts/:id", requireAuth, async (req: AuthRequest, res) => {
-    try {
-      const userUid = req.user?.uid;
-      if (!userUid) {
-        return res.status(401).json({ error: "Unauthorized" });
-      }
-
-      const postId = parseInt(req.params.id);
-      if (isNaN(postId)) {
-        return res.status(400).json({ error: "Invalid post ID" });
-      }
-
-      const { title, content, excerpt, imageUrl, videoUrl, category, isPublished } = req.body;
-      if (!title || !content) {
-        return res.status(400).json({ error: "Tiêu đề và nội dung là bắt buộc" });
-      }
-
-      const updated = await db.update(posts)
-        .set({
-          title,
-          content,
-          excerpt: excerpt || "",
-          imageUrl: imageUrl || "https://images.unsplash.com/photo-1600585154340-be6161a56a0c?auto=format&fit=crop&w=800&q=80",
-          videoUrl: videoUrl || "",
-          category: category || "Tin tức",
-          isPublished: isPublished !== undefined ? isPublished : true,
-          updatedAt: new Date(),
-        })
-        .where(eq(posts.id, postId))
-        .returning();
-
-      if (updated.length === 0) {
-        return res.status(404).json({ error: "Post not found" });
-      }
-
-      return res.json(updated[0]);
-    } catch (error: any) {
-      console.error("Update post error:", error);
-      return res.status(500).json({ error: error.message || "Failed to update post" });
-    }
-  });
-
-  // Delete a post (Admin only)
-  app.delete("/api/posts/:id", requireAuth, async (req: AuthRequest, res) => {
-    try {
-      const userUid = req.user?.uid;
-      if (!userUid) {
-        return res.status(401).json({ error: "Unauthorized" });
-      }
-
-      const postId = parseInt(req.params.id);
-      if (isNaN(postId)) {
-        return res.status(400).json({ error: "Invalid post ID" });
-      }
-
-      const deleted = await db.delete(posts)
-        .where(eq(posts.id, postId))
-        .returning();
-
-      if (deleted.length === 0) {
-        return res.status(404).json({ error: "Post not found" });
-      }
-
-      return res.json({ success: true, deleted: deleted[0] });
-    } catch (error: any) {
-      console.error("Delete post error:", error);
-      return res.status(500).json({ error: error.message || "Failed to delete post" });
-    }
+  // Simple ultra-lightweight ping endpoint for internet/connection health check
+  app.get("/api/ping", (req, res) => {
+    res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+    return res.json({ ok: true, timestamp: new Date().toISOString() });
   });
 
   // --- KIOTX POSTGRESQL MULTI-TENANT BACKEND SYNC ENDPOINTS ---
@@ -318,11 +143,11 @@ QUAN TRỌNG: Hãy trả lời cô đọng, súc tích (khoảng 3 đến tối 
   // 1. Fetch all SaaS trials
   app.get("/api/trials", async (req, res) => {
     try {
-      const allTrials = await db.select().from(trials);
+      const allTrials = await executeWithRetry(() => db.select().from(trials));
       return res.json(allTrials);
     } catch (error: any) {
       console.error("Fetch trials error:", error);
-      return res.status(500).json({ error: "Failed to fetch SaaS trials" });
+      return res.status(500).json({ error: error?.message || "Failed to fetch SaaS trials" });
     }
   });
 
@@ -333,7 +158,23 @@ QUAN TRỌNG: Hãy trả lời cô đọng, súc tích (khoảng 3 đến tối 
       if (!trialData.id || !trialData.shopName) {
         return res.status(400).json({ error: "Thiếu ID dùng thử hoặc tên cửa hàng" });
       }
-      const newTrial = await db.insert(trials)
+
+      const updateSet: any = {
+        shopName: trialData.shopName,
+        ownerName: trialData.ownerName || "",
+        phone: trialData.phone || "",
+        email: trialData.email || "",
+        password: trialData.password || "",
+        address: trialData.address || "",
+        notes: trialData.notes || "",
+        expireDate: trialData.expireDate,
+        status: trialData.status || "TRIAL_ACTIVE",
+      };
+      if (trialData.allowedModules !== undefined) {
+        updateSet.allowedModules = trialData.allowedModules;
+      }
+
+      const newTrial = await executeWithRetry(() => db.insert(trials)
         .values({
           id: trialData.id,
           shopName: trialData.shopName,
@@ -346,22 +187,13 @@ QUAN TRỌNG: Hãy trả lời cô đọng, súc tích (khoảng 3 đến tối 
           createdAt: trialData.createdAt || new Date().toISOString(),
           expireDate: trialData.expireDate || new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString(),
           status: trialData.status || "TRIAL_ACTIVE",
+          allowedModules: trialData.allowedModules || null,
         })
         .onConflictDoUpdate({
           target: trials.id,
-          set: {
-            shopName: trialData.shopName,
-            ownerName: trialData.ownerName || "",
-            phone: trialData.phone || "",
-            email: trialData.email || "",
-            password: trialData.password || "",
-            address: trialData.address || "",
-            notes: trialData.notes || "",
-            expireDate: trialData.expireDate,
-            status: trialData.status || "TRIAL_ACTIVE",
-          }
+          set: updateSet,
         })
-        .returning();
+        .returning());
       return res.json(newTrial[0]);
     } catch (error: any) {
       console.error("Create trial error:", error);
@@ -503,14 +335,14 @@ QUAN TRỌNG: Hãy trả lời cô đọng, súc tích (khoảng 3 đến tối 
 
       for (const table of tablesToDelete) {
         try {
-          await table.action();
+          await executeWithRetry(() => table.action());
         } catch (tableErr) {
           console.warn(`[Cascade Delete Warning] Could not delete from ${table.name} for trial ${id}:`, tableErr);
         }
       }
       
       // Delete the actual trial parent record
-      await db.delete(trials).where(eq(trials.id, id));
+      await executeWithRetry(() => db.delete(trials).where(eq(trials.id, id)));
 
       // Also delete the Firestore document via REST API to ensure no synchronization loops recreate it
       try {
@@ -534,19 +366,37 @@ QUAN TRỌNG: Hãy trả lời cô đọng, súc tích (khoảng 3 đến tối 
     try {
       const trialId = req.params.trialId;
       
-      const productsList = await db.select().from(productsTable).where(eq(productsTable.trialId, trialId));
-      const categoriesList = await db.select().from(categoriesTable).where(eq(categoriesTable.trialId, trialId));
-      const customersList = await db.select().from(customersTable).where(eq(customersTable.trialId, trialId));
-      const suppliersList = await db.select().from(suppliersTable).where(eq(suppliersTable.trialId, trialId));
-      const invoicesList = await db.select().from(invoicesTable).where(eq(invoicesTable.trialId, trialId));
-      const staffList = await db.select().from(staffTable).where(eq(staffTable.trialId, trialId));
-      const settingsList = await db.select().from(settingsTable).where(eq(settingsTable.trialId, trialId));
-      const auditsList = await db.select().from(auditsTable).where(eq(auditsTable.trialId, trialId));
-      const purchaseOrdersList = await db.select().from(purchaseOrdersTable).where(eq(purchaseOrdersTable.trialId, trialId));
-      const cashbookList = await db.select().from(cashbookTable).where(eq(cashbookTable.trialId, trialId));
-      const projectsList = await db.select().from(projectsTable).where(eq(projectsTable.trialId, trialId));
-      const cashShiftsList = await db.select().from(cashShiftsTable).where(eq(cashShiftsTable.trialId, trialId));
-      const systemLogsList = await db.select().from(systemLogsTable).where(eq(systemLogsTable.trialId, trialId));
+      const {
+        productsList,
+        categoriesList,
+        customersList,
+        suppliersList,
+        invoicesList,
+        staffList,
+        settingsList,
+        auditsList,
+        purchaseOrdersList,
+        cashbookList,
+        projectsList,
+        cashShiftsList,
+        systemLogsList
+      } = await executeWithRetry(async () => {
+        return {
+          productsList: await db.select().from(productsTable).where(eq(productsTable.trialId, trialId)),
+          categoriesList: await db.select().from(categoriesTable).where(eq(categoriesTable.trialId, trialId)),
+          customersList: await db.select().from(customersTable).where(eq(customersTable.trialId, trialId)),
+          suppliersList: await db.select().from(suppliersTable).where(eq(suppliersTable.trialId, trialId)),
+          invoicesList: await db.select().from(invoicesTable).where(eq(invoicesTable.trialId, trialId)),
+          staffList: await db.select().from(staffTable).where(eq(staffTable.trialId, trialId)),
+          settingsList: await db.select().from(settingsTable).where(eq(settingsTable.trialId, trialId)),
+          auditsList: await db.select().from(auditsTable).where(eq(auditsTable.trialId, trialId)),
+          purchaseOrdersList: await db.select().from(purchaseOrdersTable).where(eq(purchaseOrdersTable.trialId, trialId)),
+          cashbookList: await db.select().from(cashbookTable).where(eq(cashbookTable.trialId, trialId)),
+          projectsList: await db.select().from(projectsTable).where(eq(projectsTable.trialId, trialId)),
+          cashShiftsList: await db.select().from(cashShiftsTable).where(eq(cashShiftsTable.trialId, trialId)),
+          systemLogsList: await db.select().from(systemLogsTable).where(eq(systemLogsTable.trialId, trialId)),
+        };
+      });
 
       return res.json({
         products: productsList,
@@ -590,37 +440,166 @@ QUAN TRỌNG: Hãy trả lời cô đọng, súc tích (khoảng 3 đến tối 
       } = req.body;
 
       // Helper to safely replace data for this specific tenant / trial
-      const syncTable = async (tableObj: any, dataList: any[]) => {
-        // First delete old records of this tenant
-        await db.delete(tableObj).where(eq(tableObj.trialId, trialId));
-        if (dataList && dataList.length > 0) {
-          // Map data list to have correct trialId
-          const mappedList = dataList.map((item: any) => {
-            const copy = { ...item, trialId: trialId };
-            // Ensure any arrays are stored correctly as jsonb
-            return copy;
+      const syncTable = async (tableObj: any, dataList: any[], tableName: string) => {
+        try {
+          // First delete old records of this tenant
+          await executeWithRetry(() => db.delete(tableObj).where(eq(tableObj.trialId, trialId)));
+          if (dataList && dataList.length > 0) {
+            // Map data list to have correct trialId and sanitize fields
+            const mappedList = dataList.map((item: any) => {
+              const copy = { ...item, trialId: trialId };
+              
+              // Normalize based on table name
+              if (tableName === "products") {
+                copy.costPrice = (copy.costPrice !== undefined && copy.costPrice !== null && copy.costPrice !== "") ? Number(copy.costPrice) : 0;
+                copy.sellingPrice = (copy.sellingPrice !== undefined && copy.sellingPrice !== null && copy.sellingPrice !== "") ? Number(copy.sellingPrice) : 0;
+                copy.stock = (copy.stock !== undefined && copy.stock !== null && copy.stock !== "") ? Number(copy.stock) : 0;
+                copy.minStock = (copy.minStock !== undefined && copy.minStock !== null && copy.minStock !== "") ? Number(copy.minStock) : 0;
+                copy.conversionRate = (copy.conversionRate !== undefined && copy.conversionRate !== null && copy.conversionRate !== "") ? Number(copy.conversionRate) : null;
+                copy.barcode = (copy.barcode && copy.barcode !== "") ? copy.barcode : null;
+                copy.imageUrl = (copy.imageUrl && copy.imageUrl !== "") ? copy.imageUrl : null;
+                copy.expiryDate = (copy.expiryDate && copy.expiryDate !== "") ? copy.expiryDate : null;
+                copy.parentUnitId = (copy.parentUnitId && copy.parentUnitId !== "") ? copy.parentUnitId : null;
+              } else if (tableName === "categories") {
+                copy.description = (copy.description && copy.description !== "") ? copy.description : null;
+                copy.icon = (copy.icon && copy.icon !== "") ? copy.icon : null;
+              } else if (tableName === "customers") {
+                copy.totalSpent = (copy.totalSpent !== undefined && copy.totalSpent !== null && copy.totalSpent !== "") ? Number(copy.totalSpent) : 0;
+                copy.points = (copy.points !== undefined && copy.points !== null && copy.points !== "") ? Number(copy.points) : 0;
+                copy.debt = (copy.debt !== undefined && copy.debt !== null && copy.debt !== "") ? Number(copy.debt) : null;
+                copy.email = (copy.email && copy.email !== "") ? copy.email : null;
+                copy.address = (copy.address && copy.address !== "") ? copy.address : null;
+                copy.avatar = (copy.avatar && copy.avatar !== "") ? copy.avatar : null;
+              } else if (tableName === "suppliers") {
+                copy.debt = (copy.debt !== undefined && copy.debt !== null && copy.debt !== "") ? Number(copy.debt) : null;
+                copy.email = (copy.email && copy.email !== "") ? copy.email : null;
+                copy.address = (copy.address && copy.address !== "") ? copy.address : null;
+                copy.companyName = (copy.companyName && copy.companyName !== "") ? copy.companyName : null;
+              } else if (tableName === "invoices") {
+                copy.totalOriginal = (copy.totalOriginal !== undefined && copy.totalOriginal !== null && copy.totalOriginal !== "") ? Number(copy.totalOriginal) : 0;
+                copy.discountAmount = (copy.discountAmount !== undefined && copy.discountAmount !== null && copy.discountAmount !== "") ? Number(copy.discountAmount) : 0;
+                copy.totalPayable = (copy.totalPayable !== undefined && copy.totalPayable !== null && copy.totalPayable !== "") ? Number(copy.totalPayable) : 0;
+                copy.pointsEarned = (copy.pointsEarned !== undefined && copy.pointsEarned !== null && copy.pointsEarned !== "") ? Number(copy.pointsEarned) : 0;
+                copy.taxRate = (copy.taxRate !== undefined && copy.taxRate !== null && copy.taxRate !== "") ? Number(copy.taxRate) : null;
+                copy.taxAmount = (copy.taxAmount !== undefined && copy.taxAmount !== null && copy.taxAmount !== "") ? Number(copy.taxAmount) : null;
+                copy.customerId = (copy.customerId && copy.customerId !== "") ? copy.customerId : null;
+                copy.cancelReason = (copy.cancelReason && copy.cancelReason !== "") ? copy.cancelReason : null;
+                copy.cancelledBy = (copy.cancelledBy && copy.cancelledBy !== "") ? copy.cancelledBy : null;
+                copy.cancelDate = (copy.cancelDate && copy.cancelDate !== "") ? copy.cancelDate : null;
+                copy.eInvoiceCode = (copy.eInvoiceCode && copy.eInvoiceCode !== "") ? copy.eInvoiceCode : null;
+                copy.eInvoiceStatus = (copy.eInvoiceStatus && copy.eInvoiceStatus !== "") ? copy.eInvoiceStatus : null;
+                copy.eInvoiceUrl = (copy.eInvoiceUrl && copy.eInvoiceUrl !== "") ? copy.eInvoiceUrl : null;
+                copy.eInvoiceError = (copy.eInvoiceError && copy.eInvoiceError !== "") ? copy.eInvoiceError : null;
+                
+                if (typeof copy.items === "string") {
+                  try { copy.items = JSON.parse(copy.items); } catch (_) { copy.items = []; }
+                }
+                copy.items = Array.isArray(copy.items) ? copy.items : [];
+              } else if (tableName === "staff") {
+                if (typeof copy.permissions === "string") {
+                  try { copy.permissions = JSON.parse(copy.permissions); } catch (_) { copy.permissions = null; }
+                }
+              } else if (tableName === "audits") {
+                copy.notes = (copy.notes && copy.notes !== "") ? copy.notes : null;
+                if (typeof copy.items === "string") {
+                  try { copy.items = JSON.parse(copy.items); } catch (_) { copy.items = []; }
+                }
+                copy.items = Array.isArray(copy.items) ? copy.items : [];
+              } else if (tableName === "purchaseOrders") {
+                copy.totalAmount = (copy.totalAmount !== undefined && copy.totalAmount !== null && copy.totalAmount !== "") ? Number(copy.totalAmount) : 0;
+                copy.amountPaid = (copy.amountPaid !== undefined && copy.amountPaid !== null && copy.amountPaid !== "") ? Number(copy.amountPaid) : 0;
+                copy.amountOwed = (copy.amountOwed !== undefined && copy.amountOwed !== null && copy.amountOwed !== "") ? Number(copy.amountOwed) : 0;
+                if (typeof copy.items === "string") {
+                  try { copy.items = JSON.parse(copy.items); } catch (_) { copy.items = []; }
+                }
+                copy.items = Array.isArray(copy.items) ? copy.items : [];
+              } else if (tableName === "cashbook") {
+                copy.amount = (copy.amount !== undefined && copy.amount !== null && copy.amount !== "") ? Number(copy.amount) : 0;
+              } else if (tableName === "projects") {
+                copy.budget = (copy.budget !== undefined && copy.budget !== null && copy.budget !== "") ? Number(copy.budget) : 0;
+                copy.expenses = (copy.expenses !== undefined && copy.expenses !== null && copy.expenses !== "") ? Number(copy.expenses) : 0;
+                copy.customerId = (copy.customerId && copy.customerId !== "") ? copy.customerId : null;
+                copy.endDate = (copy.endDate && copy.endDate !== "") ? copy.endDate : null;
+                copy.notes = (copy.notes && copy.notes !== "") ? copy.notes : null;
+                
+                if (typeof copy.materials === "string") {
+                  try { copy.materials = JSON.parse(copy.materials); } catch (_) { copy.materials = []; }
+                }
+                copy.materials = Array.isArray(copy.materials) ? copy.materials : [];
+                
+                if (typeof copy.staff === "string") {
+                  try { copy.staff = JSON.parse(copy.staff); } catch (_) { copy.staff = []; }
+                }
+                copy.staff = Array.isArray(copy.staff) ? copy.staff : [];
+              } else if (tableName === "cashShifts") {
+                copy.code = (copy.code && copy.code !== "") ? copy.code : (copy.id || "CA000");
+                copy.startTime = (copy.startTime && copy.startTime !== "") ? copy.startTime : new Date().toISOString();
+                copy.staffId = (copy.staffId && copy.staffId !== "") ? copy.staffId : "NV000";
+                copy.staffName = (copy.staffName && copy.staffName !== "") ? copy.staffName : "Thu ngân";
+                copy.initialCash = (copy.initialCash !== undefined && copy.initialCash !== null && copy.initialCash !== "") ? Number(copy.initialCash) : 0;
+                copy.expectedCash = (copy.expectedCash !== undefined && copy.expectedCash !== null && copy.expectedCash !== "") ? Number(copy.expectedCash) : 0;
+                copy.expectedBank = (copy.expectedBank !== undefined && copy.expectedBank !== null && copy.expectedBank !== "") ? Number(copy.expectedBank) : 0;
+                copy.actualCash = (copy.actualCash !== undefined && copy.actualCash !== null && copy.actualCash !== "") ? Number(copy.actualCash) : null;
+                copy.actualBank = (copy.actualBank !== undefined && copy.actualBank !== null && copy.actualBank !== "") ? Number(copy.actualBank) : null;
+                copy.endTime = (copy.endTime && copy.endTime !== "") ? copy.endTime : null;
+                copy.notes = (copy.notes && copy.notes !== "") ? copy.notes : null;
+                copy.status = (copy.status && copy.status !== "") ? copy.status : "OPEN";
+              } else if (tableName === "systemLogs") {
+                copy.actionType = (copy.actionType && copy.actionType !== "") ? copy.actionType : "INFO";
+                copy.actionName = (copy.actionName && copy.actionName !== "") ? copy.actionName : "Thao tác hệ thống";
+                copy.description = (copy.description && copy.description !== "") ? copy.description : "Cập nhật nhật ký";
+                copy.actorName = (copy.actorName && copy.actorName !== "") ? copy.actorName : "Hệ thống";
+                copy.actorRole = (copy.actorRole && copy.actorRole !== "") ? copy.actorRole : "SYSTEM";
+                copy.timestamp = (copy.timestamp && copy.timestamp !== "") ? copy.timestamp : new Date().toISOString();
+              }
+
+              return copy;
+            });
+
+            // Safely deduplicate mappedList by 'id' to prevent primary key constraint violations (e.g. duplicate key value violates unique constraint)
+            const seenIds = new Set<string>();
+            const uniqueMappedList = [];
+            for (let i = mappedList.length - 1; i >= 0; i--) {
+              const item = mappedList[i];
+              if (item.id && !seenIds.has(item.id)) {
+                seenIds.add(item.id);
+                uniqueMappedList.unshift(item);
+              } else if (!item.id) {
+                uniqueMappedList.unshift(item);
+              }
+            }
+
+            // Perform batch insert
+            await executeWithRetry(() => db.insert(tableObj).values(uniqueMappedList));
+          }
+        } catch (tableError: any) {
+          console.error(`Syncing table ${tableName} failed:`, {
+            message: tableError.message,
+            detail: tableError.detail,
+            hint: tableError.hint,
+            stack: tableError.stack,
+            code: tableError.code
           });
-          // Perform batch insert
-          await db.insert(tableObj).values(mappedList);
+          throw new Error(`Lỗi đồng bộ bảng ${tableName}: ${tableError.message} - ${tableError.detail || ""}`);
         }
       };
 
-      if (products !== undefined) await syncTable(productsTable, products);
-      if (categories !== undefined) await syncTable(categoriesTable, categories);
-      if (customers !== undefined) await syncTable(customersTable, customers);
-      if (suppliers !== undefined) await syncTable(suppliersTable, suppliers);
-      if (invoices !== undefined) await syncTable(invoicesTable, invoices);
-      if (staff !== undefined) await syncTable(staffTable, staff);
-      if (audits !== undefined) await syncTable(auditsTable, audits);
-      if (purchaseOrders !== undefined) await syncTable(purchaseOrdersTable, purchaseOrders);
-      if (cashbook !== undefined) await syncTable(cashbookTable, cashbook);
-      if (projects !== undefined) await syncTable(projectsTable, projects);
-      if (cashShifts !== undefined) await syncTable(cashShiftsTable, cashShifts);
-      if (systemLogs !== undefined) await syncTable(systemLogsTable, systemLogs);
+      if (products !== undefined) await syncTable(productsTable, products, "products");
+      if (categories !== undefined) await syncTable(categoriesTable, categories, "categories");
+      if (customers !== undefined) await syncTable(customersTable, customers, "customers");
+      if (suppliers !== undefined) await syncTable(suppliersTable, suppliers, "suppliers");
+      if (invoices !== undefined) await syncTable(invoicesTable, invoices, "invoices");
+      if (staff !== undefined) await syncTable(staffTable, staff, "staff");
+      if (audits !== undefined) await syncTable(auditsTable, audits, "audits");
+      if (purchaseOrders !== undefined) await syncTable(purchaseOrdersTable, purchaseOrders, "purchaseOrders");
+      if (cashbook !== undefined) await syncTable(cashbookTable, cashbook, "cashbook");
+      if (projects !== undefined) await syncTable(projectsTable, projects, "projects");
+      if (cashShifts !== undefined) await syncTable(cashShiftsTable, cashShifts, "cashShifts");
+      if (systemLogs !== undefined) await syncTable(systemLogsTable, systemLogs, "systemLogs");
 
       if (settings !== undefined && settings !== null) {
-        await db.delete(settingsTable).where(eq(settingsTable.trialId, trialId));
-        await db.insert(settingsTable).values({
+        await executeWithRetry(() => db.delete(settingsTable).where(eq(settingsTable.trialId, trialId)));
+        await executeWithRetry(() => db.insert(settingsTable).values({
           trialId: trialId,
           shopName: settings.shopName || "KiotX Store",
           address: settings.address || "Chưa cập nhật",
@@ -643,7 +622,7 @@ QUAN TRỌNG: Hãy trả lời cô đọng, súc tích (khoảng 3 đến tối 
           eInvoicePassword: settings.eInvoicePassword || null,
           eInvoicePattern: settings.eInvoicePattern || null,
           eInvoiceSerial: settings.eInvoiceSerial || null,
-        });
+        }));
       }
 
       return res.json({ success: true, timestamp: new Date().toISOString() });
@@ -667,7 +646,7 @@ QUAN TRỌNG: Hãy trả lời cô đọng, súc tích (khoảng 3 đến tối 
       let settings = shopSetting;
       if (!settings) {
         try {
-          const settingsList = await db.select().from(settingsTable).where(eq(settingsTable.trialId, trialId));
+          const settingsList = await executeWithRetry(() => db.select().from(settingsTable).where(eq(settingsTable.trialId, trialId)));
           settings = settingsList[0];
         } catch (e) {
           console.error("Failed to fetch settings from db for email:", e);

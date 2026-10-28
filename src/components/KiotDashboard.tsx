@@ -6,7 +6,7 @@ import {
   TrendingUp, ArrowUpRight, ArrowDownRight, Package, ShoppingBag, 
   DollarSign, Users, AlertTriangle, Layers, Calendar, ChevronRight, Activity,
   Search, Eye, X, Clock, CreditCard, Banknote, QrCode, User, FileText, RefreshCw, Download, FileSpreadsheet, Trash2,
-  Printer, Mail, Plus, Cloud, Sparkles
+  Printer, Mail, Plus, Cloud, Sparkles, Filter
 } from "lucide-react";
 import { 
   AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
@@ -36,6 +36,18 @@ interface KiotDashboardProps {
 }
 
 export default function KiotDashboard({ products, invoices, categories, currentStaff, staffList = [], systemLogs = [], onNavigateToTab, onCancelInvoice, onUpdateInvoice, customers = [], suppliers = [], settings, onDeleteReportsData }: KiotDashboardProps) {
+  const hasPermission = (perm: "reportViewProfit") => {
+    if (!currentStaff) return true;
+    if (currentStaff.role === "OWNER") return true;
+    if (currentStaff.permissions?.[perm] !== undefined) {
+      return currentStaff.permissions[perm];
+    }
+    if (currentStaff.role === "MANAGER") {
+      return true;
+    }
+    return false;
+  };
+
   const [timeRange, setTimeRange] = useState<"today" | "yesterday" | "7days" | "30days">("7days");
   
   // Detect local trial state
@@ -116,22 +128,8 @@ export default function KiotDashboard({ products, invoices, categories, currentS
     formattedRangeStr: string;
   } | null>(null);
 
-  // System Audit Log filter states
-  const [logSearch, setLogSearch] = useState("");
-  const [logTypeFilter, setLogTypeFilter] = useState<string>("ALL");
-
-  const filteredLogs = useMemo(() => {
-    return systemLogs.filter(log => {
-      const matchesSearch = 
-        log.actorName.toLowerCase().includes(logSearch.toLowerCase()) ||
-        log.description.toLowerCase().includes(logSearch.toLowerCase()) ||
-        log.actionName.toLowerCase().includes(logSearch.toLowerCase());
-      
-      const matchesType = logTypeFilter === "ALL" || log.actionType === logTypeFilter;
-      
-      return matchesSearch && matchesType;
-    });
-  }, [systemLogs, logSearch, logTypeFilter]);
+  // Local state to toggle showing full invoice transactions list or compact 5-invoice widget
+  const [showFullInvoices, setShowFullInvoices] = useState(false);
 
   // Invoice cancellation states
   const [isCancelModalOpen, setIsCancelModalOpen] = useState(false);
@@ -148,6 +146,419 @@ export default function KiotDashboard({ products, invoices, categories, currentS
   const [isSendingEmail, setIsSendingEmail] = useState(false);
   const [emailLogs, setEmailLogs] = useState<string[]>([]);
   const [showEmailLogs, setShowEmailLogs] = useState(false);
+
+  // 1. Calculate stats based on time range (synchronized with dateFilterType for instant updates)
+  const filteredInvoices = useMemo(() => {
+    const now = new Date();
+    // Midnight today
+    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    // Midnight yesterday
+    const yesterdayStart = new Date(todayStart);
+    yesterdayStart.setDate(todayStart.getDate() - 1);
+
+    return invoices.filter(inv => {
+      // Filter by staff if active
+      if (dashboardStaffFilter !== "all") {
+        if (inv.cashierName !== dashboardStaffFilter) {
+          return false;
+        }
+      }
+
+      const invDate = new Date(inv.date);
+      const invDayStart = new Date(invDate.getFullYear(), invDate.getMonth(), invDate.getDate());
+      
+      if (dateFilterType === "all") {
+        return true;
+      } else if (dateFilterType === "today") {
+        return invDayStart.getTime() === todayStart.getTime();
+      } else if (dateFilterType === "yesterday") {
+        return invDayStart.getTime() === yesterdayStart.getTime();
+      } else if (dateFilterType === "7days") {
+        const diffTime = todayStart.getTime() - invDayStart.getTime();
+        const diffDays = diffTime / (1000 * 60 * 60 * 24);
+        return diffDays >= 0 && diffDays < 7;
+      } else if (dateFilterType === "30days") {
+        const diffTime = todayStart.getTime() - invDayStart.getTime();
+        const diffDays = diffTime / (1000 * 60 * 60 * 24);
+        return diffDays >= 0 && diffDays < 30;
+      } else if (dateFilterType === "custom") {
+        if (startDate) {
+          const start = new Date(startDate);
+          start.setHours(0, 0, 0, 0);
+          if (invDate < start) return false;
+        }
+        if (endDate) {
+          const end = new Date(endDate);
+          end.setHours(23, 59, 59, 999);
+          if (invDate > end) return false;
+        }
+        return true;
+      }
+      return true;
+    });
+  }, [invoices, dateFilterType, startDate, endDate, dashboardStaffFilter]);
+
+  // Trung tâm Báo cáo & Phân tích chuyên sâu States
+  const [repTab, setRepTab] = useState<"summary" | "time" | "cashier" | "category">("summary");
+  const [repPeriod, setRepPeriod] = useState<"today" | "yesterday" | "7days" | "30days" | "this_month" | "last_month" | "this_year" | "custom">("7days");
+  const [repStart, setRepStart] = useState("");
+  const [repEnd, setRepEnd] = useState("");
+  const [repYear, setRepYear] = useState(() => new Date().getFullYear().toString());
+  const [repMonth, setRepMonth] = useState(() => new Date().toISOString().substring(0, 7));
+  const [repSelectedCashier, setRepSelectedCashier] = useState("all");
+  const [repChronologicalType, setRepChronologicalType] = useState<"day" | "month" | "year">("day");
+
+  // Advanced Report Filtered Invoices (Synchronized with Header Filter)
+  const reportFilteredInvoices = filteredInvoices;
+
+  // Advanced Report Stats
+  const reportStats = useMemo(() => {
+    let totalRevenue = 0;
+    let totalDiscount = 0;
+    let totalCost = 0;
+    let transactionCount = reportFilteredInvoices.length;
+
+    reportFilteredInvoices.forEach(inv => {
+      totalRevenue += inv.totalPayable;
+      totalDiscount += inv.discountAmount;
+
+      inv.items.forEach(item => {
+        const prod = products.find(p => p.id === item.productId || p.code === item.productCode);
+        if (prod) {
+          totalCost += prod.costPrice * item.quantity;
+        } else {
+          totalCost += (item.unitPrice * 0.5) * item.quantity;
+        }
+      });
+    });
+
+    const netProfit = totalRevenue - totalCost;
+    const profitMargin = totalRevenue > 0 ? (netProfit / totalRevenue) * 100 : 0;
+
+    return {
+      revenue: totalRevenue,
+      discount: totalDiscount,
+      cost: totalCost,
+      profit: netProfit,
+      margin: profitMargin,
+      transactions: transactionCount
+    };
+  }, [reportFilteredInvoices, products]);
+
+  // Chronological Daily Data
+  const chronologicalDailyData = useMemo(() => {
+    if (!repMonth) return [];
+    const [yearStr, monthStr] = repMonth.split("-");
+    const year = parseInt(yearStr);
+    const month = parseInt(monthStr) - 1; // 0-indexed
+    
+    const daysInMonth = new Date(year, month + 1, 0).getDate();
+    const data: Record<number, { day: number; dateStr: string; revenue: number; cost: number; profit: number; transactions: number }> = {};
+    
+    // Initialize
+    for (let d = 1; d <= daysInMonth; d++) {
+      const formattedDate = `${String(d).padStart(2, "0")}/${String(month + 1).padStart(2, "0")}`;
+      data[d] = {
+        day: d,
+        dateStr: formattedDate,
+        revenue: 0,
+        cost: 0,
+        profit: 0,
+        transactions: 0
+      };
+    }
+    
+    // Aggregate invoices
+    invoices.forEach(inv => {
+      const invDate = new Date(inv.date);
+      if (invDate.getFullYear() === year && invDate.getMonth() === month) {
+        const d = invDate.getDate();
+        if (data[d]) {
+          data[d].transactions += 1;
+          data[d].revenue += inv.totalPayable;
+          
+          let cost = 0;
+          inv.items.forEach(item => {
+            const prod = products.find(p => p.id === item.productId || p.code === item.productCode);
+            cost += prod ? prod.costPrice * item.quantity : (item.unitPrice * 0.5) * item.quantity;
+          });
+          data[d].cost += cost;
+          data[d].profit += (inv.totalPayable - cost);
+        }
+      }
+    });
+    
+    return Object.values(data);
+  }, [invoices, products, repMonth]);
+
+  // Chronological Monthly Data
+  const chronologicalMonthlyData = useMemo(() => {
+    const year = parseInt(repYear) || new Date().getFullYear();
+    const data: Record<number, { month: number; monthStr: string; revenue: number; cost: number; profit: number; transactions: number }> = {};
+    
+    // Initialize 12 months
+    for (let m = 1; m <= 12; m++) {
+      data[m] = {
+        month: m,
+        monthStr: `Tháng ${m}`,
+        revenue: 0,
+        cost: 0,
+        profit: 0,
+        transactions: 0
+      };
+    }
+    
+    // Aggregate invoices
+    invoices.forEach(inv => {
+      const invDate = new Date(inv.date);
+      if (invDate.getFullYear() === year) {
+        const m = invDate.getMonth() + 1; // 1-12
+        if (data[m]) {
+          data[m].transactions += 1;
+          data[m].revenue += inv.totalPayable;
+          
+          let cost = 0;
+          inv.items.forEach(item => {
+            const prod = products.find(p => p.id === item.productId || p.code === item.productCode);
+            cost += prod ? prod.costPrice * item.quantity : (item.unitPrice * 0.5) * item.quantity;
+          });
+          data[m].cost += cost;
+          data[m].profit += (inv.totalPayable - cost);
+        }
+      }
+    });
+    
+    return Object.values(data);
+  }, [invoices, products, repYear]);
+
+  // Chronological Yearly Data
+  const chronologicalYearlyData = useMemo(() => {
+    const years = Array.from(new Set(invoices.map(inv => new Date(inv.date).getFullYear())));
+    if (years.length === 0) {
+      years.push(new Date().getFullYear());
+    }
+    const data = years.sort().map(yr => {
+      let revenue = 0;
+      let cost = 0;
+      let profit = 0;
+      let transactions = 0;
+      
+      invoices.forEach(inv => {
+        const invDate = new Date(inv.date);
+        if (invDate.getFullYear() === yr) {
+          transactions += 1;
+          revenue += inv.totalPayable;
+          
+          inv.items.forEach(item => {
+            const prod = products.find(p => p.id === item.productId || p.code === item.productCode);
+            cost += prod ? prod.costPrice * item.quantity : (item.unitPrice * 0.5) * item.quantity;
+          });
+        }
+      });
+      profit = revenue - cost;
+      
+      return {
+        year: yr,
+        yearStr: `Năm ${yr}`,
+        revenue,
+        cost,
+        profit,
+        transactions
+      };
+    });
+    
+    return data;
+  }, [invoices, products]);
+
+  // Detailed Employee Performance Analytics
+  const detailedEmployeePerformance = useMemo(() => {
+    const result: Record<string, {
+      id: string;
+      name: string;
+      role: string;
+      totalRevenue: number;
+      invoiceCount: number;
+      itemsSold: number;
+      avgInvoiceValue: number;
+      commissionEarned: number;
+      paymentMethodBreakdown: { CASH: number; BANK_TRANSFER: number; CREDIT_CARD: number };
+    }> = {};
+
+    // Base initial structures
+    staffList.forEach(s => {
+      result[s.name] = {
+        id: s.id,
+        name: s.name,
+        role: s.role,
+        totalRevenue: 0,
+        invoiceCount: 0,
+        itemsSold: 0,
+        avgInvoiceValue: 0,
+        commissionEarned: 0,
+        paymentMethodBreakdown: { CASH: 0, BANK_TRANSFER: 0, CREDIT_CARD: 0 }
+      };
+    });
+
+    reportFilteredInvoices.forEach(inv => {
+      const name = inv.cashierName || "Không rõ";
+      if (!result[name]) {
+        result[name] = {
+          id: "temp",
+          name,
+          role: "NV Thời vụ",
+          totalRevenue: 0,
+          invoiceCount: 0,
+          itemsSold: 0,
+          avgInvoiceValue: 0,
+          commissionEarned: 0,
+          paymentMethodBreakdown: { CASH: 0, BANK_TRANSFER: 0, CREDIT_CARD: 0 }
+        };
+      }
+      
+      result[name].totalRevenue += inv.totalPayable;
+      result[name].invoiceCount += 1;
+      
+      const qty = inv.items.reduce((sum, item) => sum + item.quantity, 0);
+      result[name].itemsSold += qty;
+      
+      if (inv.paymentMethod === "CASH") result[name].paymentMethodBreakdown.CASH += inv.totalPayable;
+      else if (inv.paymentMethod === "BANK_TRANSFER") result[name].paymentMethodBreakdown.BANK_TRANSFER += inv.totalPayable;
+      else result[name].paymentMethodBreakdown.CREDIT_CARD += inv.totalPayable;
+    });
+
+    return Object.values(result).map(r => {
+      const commission = r.totalRevenue * 0.005; // 0.5% commission
+      return {
+        ...r,
+        avgInvoiceValue: r.invoiceCount > 0 ? r.totalRevenue / r.invoiceCount : 0,
+        commissionEarned: commission
+      };
+    }).sort((a, b) => b.totalRevenue - a.totalRevenue);
+  }, [reportFilteredInvoices, staffList]);
+
+  // Detailed Category Sales
+  const detailedCategorySales = useMemo(() => {
+    const result: Record<string, {
+      category: string;
+      revenue: number;
+      quantitySold: number;
+      invoiceCount: number;
+      totalProfit: number;
+    }> = {};
+
+    reportFilteredInvoices.forEach(inv => {
+      inv.items.forEach(item => {
+        const prod = products.find(p => p.id === item.productId || p.code === item.productCode);
+        const cat = prod?.category || "Chưa phân loại";
+        
+        if (!result[cat]) {
+          result[cat] = {
+            category: cat,
+            revenue: 0,
+            quantitySold: 0,
+            invoiceCount: 0,
+            totalProfit: 0
+          };
+        }
+        
+        result[cat].revenue += item.total;
+        result[cat].quantitySold += item.quantity;
+        
+        const costPrice = prod ? prod.costPrice : item.unitPrice * 0.5;
+        const profit = item.total - (costPrice * item.quantity);
+        result[cat].totalProfit += profit;
+      });
+    });
+
+    return Object.values(result).sort((a, b) => b.revenue - a.revenue);
+  }, [reportFilteredInvoices, products]);
+
+  // Dynamic Excel Export based on the active report tab
+  const handleExportAdvancedReportToExcel = () => {
+    try {
+      const dateString = new Date().toISOString().split("T")[0];
+      const wb = XLSX.utils.book_new();
+
+      if (repTab === "summary") {
+        const overviewData = [
+          { "Chỉ số báo cáo": "Tổng doanh số thuần", "Giá trị": reportStats.revenue },
+          { "Chỉ số báo cáo": "Tổng số hóa đơn", "Giá trị": reportStats.transactions },
+          { "Chỉ số báo cáo": "Chiết khấu hóa đơn", "Giá trị": reportStats.discount },
+          { "Chỉ số báo cáo": "Giá vốn hàng bán", "Giá trị": hasPermission("reportViewProfit") ? reportStats.cost : "Bảo mật" },
+          { "Chỉ số báo cáo": "Lợi nhuận gộp thực tế", "Giá trị": hasPermission("reportViewProfit") ? reportStats.profit : "Bảo mật" },
+          { "Chỉ số báo cáo": "Tỉ suất lợi nhuận gộp", "Giá trị": hasPermission("reportViewProfit") ? `${reportStats.margin.toFixed(2)}%` : "Bảo mật" },
+          { "Chỉ số báo cáo": "Người tạo", "Giá trị": currentStaff.name }
+        ];
+        const ws = XLSX.utils.json_to_sheet(overviewData);
+        XLSX.utils.book_append_sheet(wb, ws, "Tổng quan chuyên sâu");
+      } else if (repTab === "time") {
+        let sheetData: any[] = [];
+        let title = "";
+        if (repChronologicalType === "day") {
+          title = "Báo cáo theo Ngày";
+          sheetData = chronologicalDailyData.map(d => ({
+            "Ngày/Tháng": d.dateStr,
+            "Số giao dịch": d.transactions,
+            "Doanh thu (đ)": d.revenue,
+            "Giá vốn (đ)": hasPermission("reportViewProfit") ? d.cost : "***",
+            "Lợi nhuận (đ)": hasPermission("reportViewProfit") ? d.profit : "***"
+          }));
+        } else if (repChronologicalType === "month") {
+          title = "Báo cáo theo Tháng";
+          sheetData = chronologicalMonthlyData.map(m => ({
+            "Tháng": m.monthStr,
+            "Số giao dịch": m.transactions,
+            "Doanh thu (đ)": m.revenue,
+            "Giá vốn (đ)": hasPermission("reportViewProfit") ? m.cost : "***",
+            "Lợi nhuận (đ)": hasPermission("reportViewProfit") ? m.profit : "***"
+          }));
+        } else {
+          title = "Báo cáo theo Năm";
+          sheetData = chronologicalYearlyData.map(y => ({
+            "Năm": y.yearStr,
+            "Số giao dịch": y.transactions,
+            "Doanh thu (đ)": y.revenue,
+            "Giá vốn (đ)": hasPermission("reportViewProfit") ? y.cost : "***",
+            "Lợi nhuận (đ)": hasPermission("reportViewProfit") ? y.profit : "***"
+          }));
+        }
+        const ws = XLSX.utils.json_to_sheet(sheetData);
+        XLSX.utils.book_append_sheet(wb, ws, title);
+      } else if (repTab === "cashier") {
+        const sheetData = detailedEmployeePerformance.map(e => ({
+          "Tên nhân viên": e.name,
+          "Chức vụ": e.role,
+          "Số hóa đơn": e.invoiceCount,
+          "Số sản phẩm đã bán": e.itemsSold,
+          "Tổng doanh số chốt": e.totalRevenue,
+          "Giá trị đơn trung bình": e.avgInvoiceValue,
+          "Ước tính hoa hồng (0.5%)": e.commissionEarned
+        }));
+        const ws = XLSX.utils.json_to_sheet(sheetData);
+        XLSX.utils.book_append_sheet(wb, ws, "Hiệu suất nhân viên");
+      } else if (repTab === "category") {
+        const sheetData = detailedCategorySales.map(c => ({
+          "Nhóm hàng / Danh mục": c.category,
+          "Số đơn hàng liên quan": c.invoiceCount,
+          "Số lượng sản phẩm đã bán": c.quantitySold,
+          "Doanh số thu về (đ)": c.revenue,
+          "Lợi nhuận đóng góp (đ)": hasPermission("reportViewProfit") ? c.totalProfit : "***"
+        }));
+        const ws = XLSX.utils.json_to_sheet(sheetData);
+        XLSX.utils.book_append_sheet(wb, ws, "Doanh thu theo nhóm hàng");
+      }
+
+      XLSX.writeFile(wb, `BaoCao_ChuyenSau_${repTab}_${dateString}.xlsx`);
+      safeDispatchEvent("kiot-toast", {
+        type: "success",
+        title: "Tải báo cáo thành công",
+        message: "Tệp báo cáo chuyên đề đã được xuất và tải về máy tính của bạn."
+      });
+    } catch (err) {
+      console.error(err);
+      alert("Không thể xuất file Excel.");
+    }
+  };
 
   // Format currency
   const formatVND = (value: number) => {
@@ -178,9 +589,9 @@ export default function KiotDashboard({ products, invoices, categories, currentS
       // Sheet 1: Tổng quan
       const overviewData = [
         { "Chỉ số tài chính": "Doanh thu thuần", "Giá trị (VND)": stats.revenue, "Mô tả": "Doanh thu thực tế sau khi giảm giá hóa đơn" },
-        { "Chỉ số tài chính": "Giá vốn hàng bán", "Giá trị (VND)": stats.cost, "Mô tả": "Tổng giá vốn gốc của các mặt hàng bán ra" },
-        { "Chỉ số tài chính": "Lợi nhuận thực tế", "Giá trị (VND)": stats.profit, "Mô tả": "Doanh thu thuần - Giá vốn bán hàng" },
-        { "Chỉ số tài chính": "Tỉ suất lợi nhuận", "Giá trị (VND)": `${stats.margin.toFixed(2)}%`, "Mô tả": "Lợi nhuận thực tế / Doanh thu thuần" },
+        { "Chỉ số tài chính": "Giá vốn hàng bán", "Giá trị (VND)": hasPermission("reportViewProfit") ? stats.cost : "Bảo mật", "Mô tả": "Tổng giá vốn gốc của các mặt hàng bán ra" },
+        { "Chỉ số tài chính": "Lợi nhuận thực tế", "Giá trị (VND)": hasPermission("reportViewProfit") ? stats.profit : "Bảo mật", "Mô tả": "Doanh thu thuần - Giá vốn bán hàng" },
+        { "Chỉ số tài chính": "Tỉ suất lợi nhuận", "Giá trị (VND)": hasPermission("reportViewProfit") ? `${stats.margin.toFixed(2)}%` : "Bảo mật", "Mô tả": "Lợi nhuận thực tế / Doanh thu thuần" },
         { "Chỉ số tài chính": "Tổng giảm giá hóa đơn", "Giá trị (VND)": stats.discount, "Mô tả": "Số tiền đã giảm giá trực tiếp trên hóa đơn" },
         { "Chỉ số tài chính": "Tổng số hóa đơn phát sinh", "Giá trị (VND)": stats.transactions, "Mô tả": "Số lượng đơn hàng hoàn thành trong kỳ" },
         { "Chỉ số tài chính": "Thời gian báo cáo", "Giá trị (VND)": timeRange === "today" ? "Hôm nay" : timeRange === "yesterday" ? "Hôm qua" : timeRange === "7days" ? "7 ngày qua" : "Tháng này", "Mô tả": "" },
@@ -528,7 +939,7 @@ export default function KiotDashboard({ products, invoices, categories, currentS
 
     try {
       const pattern = settings?.eInvoicePattern || "1C26TML";
-      const serial = settings?.eInvoiceSerial || "C26TGP";
+      const serial = settings?.eInvoiceSerial || "C26KTX";
       const taxCode = settings?.eInvoiceTaxCode || "3701548239";
       
       const eInvCode = `${pattern}-${serial}-${String(Math.floor(100000 + Math.random() * 900000))}`;
@@ -670,56 +1081,6 @@ export default function KiotDashboard({ products, invoices, categories, currentS
     }
   };
 
-  // 1. Calculate stats based on time range (synchronized with dateFilterType for instant updates)
-  const filteredInvoices = useMemo(() => {
-    const now = new Date();
-    // Midnight today
-    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    // Midnight yesterday
-    const yesterdayStart = new Date(todayStart);
-    yesterdayStart.setDate(todayStart.getDate() - 1);
-
-    return invoices.filter(inv => {
-      // Filter by staff if active
-      if (dashboardStaffFilter !== "all") {
-        if (inv.cashierName !== dashboardStaffFilter) {
-          return false;
-        }
-      }
-
-      const invDate = new Date(inv.date);
-      const invDayStart = new Date(invDate.getFullYear(), invDate.getMonth(), invDate.getDate());
-      
-      if (dateFilterType === "all") {
-        return true;
-      } else if (dateFilterType === "today") {
-        return invDayStart.getTime() === todayStart.getTime();
-      } else if (dateFilterType === "yesterday") {
-        return invDayStart.getTime() === yesterdayStart.getTime();
-      } else if (dateFilterType === "7days") {
-        const diffTime = todayStart.getTime() - invDayStart.getTime();
-        const diffDays = diffTime / (1000 * 60 * 60 * 24);
-        return diffDays >= 0 && diffDays < 7;
-      } else if (dateFilterType === "30days") {
-        const diffTime = todayStart.getTime() - invDayStart.getTime();
-        const diffDays = diffTime / (1000 * 60 * 60 * 24);
-        return diffDays >= 0 && diffDays < 30;
-      } else if (dateFilterType === "custom") {
-        if (startDate) {
-          const start = new Date(startDate);
-          start.setHours(0, 0, 0, 0);
-          if (invDate < start) return false;
-        }
-        if (endDate) {
-          const end = new Date(endDate);
-          end.setHours(23, 59, 59, 999);
-          if (invDate > end) return false;
-        }
-        return true;
-      }
-      return true;
-    });
-  }, [invoices, dateFilterType, startDate, endDate, dashboardStaffFilter]);
 
   // Calculate Key Performance Indicators (KPIs)
   const stats = useMemo(() => {
@@ -1177,10 +1538,10 @@ export default function KiotDashboard({ products, invoices, categories, currentS
           </div>
           <div className="mt-4 space-y-1">
             <h3 className="text-2xl font-black text-stone-100 font-mono tracking-tight">
-              {currentStaff?.role === "OWNER" ? formatVND(stats.profit) : "******"}
+              {hasPermission("reportViewProfit") ? formatVND(stats.profit) : "******"}
             </h3>
             <p className="text-[10px] text-stone-400 flex items-center gap-1">
-              {currentStaff?.role === "OWNER" ? (
+              {hasPermission("reportViewProfit") ? (
                 <>
                   <span className="text-indigo-400 font-bold flex items-center gap-0.5">
                     <ArrowUpRight className="h-3 w-3" />
@@ -1293,7 +1654,7 @@ export default function KiotDashboard({ products, invoices, categories, currentS
                   formatter={(value: any) => [formatVND(Number(value)), ""]}
                 />
                 <Area type="monotone" dataKey="Doanh thu" stroke="#10b981" strokeWidth={1.5} fillOpacity={1} fill="url(#colorRev)" />
-                {currentStaff?.role === "OWNER" && (
+                {hasPermission("reportViewProfit") && (
                   <Area type="monotone" dataKey="Lợi nhuận" stroke="#6366f1" strokeWidth={1.5} fillOpacity={1} fill="url(#colorProf)" />
                 )}
               </AreaChart>
@@ -1354,32 +1715,27 @@ export default function KiotDashboard({ products, invoices, categories, currentS
       </div>
 
       {/* Stock Analytics Grid */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+      <div className={lowStockProducts.length === 0 ? "grid grid-cols-1 gap-5" : "grid grid-cols-1 lg:grid-cols-2 gap-5"}>
         {/* Interactive Low Stock Recharts Visual Bar Chart */}
-        <div className="p-4 rounded-2xl bg-stone-900 border border-stone-850 space-y-3">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-stone-850 pb-2">
-            <div className="space-y-0.5">
-              <h3 id="low-stock-chart-heading" className="text-xs font-bold text-stone-100 uppercase tracking-wider flex items-center gap-1.5 text-amber-500">
-                <AlertTriangle className="h-4 w-4 animate-pulse text-amber-500" />
-                <span>Biểu đồ sản phẩm sắp hết hàng (Dưới định mức tối thiểu)</span>
-              </h3>
-              <p className="text-[9px] text-stone-400">
-                Tương quan lượng tồn thực tế so với hạn mức cảnh báo tối thiểu.
-              </p>
+        {lowStockProducts.length > 0 && (
+          <div className="p-4 rounded-2xl bg-stone-900 border border-stone-850 space-y-3">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-stone-850 pb-2">
+              <div className="space-y-0.5">
+                <h3 id="low-stock-chart-heading" className="text-xs font-bold text-stone-100 uppercase tracking-wider flex items-center gap-1.5 text-amber-500">
+                  <AlertTriangle className="h-4 w-4 animate-pulse text-amber-500" />
+                  <span>Biểu đồ sản phẩm sắp hết hàng (Dưới định mức tối thiểu)</span>
+                </h3>
+                <p className="text-[9px] text-stone-400">
+                  Tương quan lượng tồn thực tế so với hạn mức cảnh báo tối thiểu.
+                </p>
+              </div>
+              <div className="flex items-center gap-2 self-start sm:self-center">
+                <span className="text-[8px] bg-rose-500/10 text-rose-400 font-bold px-1.5 py-0.5 rounded-full border border-rose-500/15 uppercase tracking-wider">
+                  Cảnh báo
+                </span>
+              </div>
             </div>
-            <div className="flex items-center gap-2 self-start sm:self-center">
-              <span className="text-[8px] bg-rose-500/10 text-rose-400 font-bold px-1.5 py-0.5 rounded-full border border-rose-500/15 uppercase tracking-wider">
-                Cảnh báo
-              </span>
-            </div>
-          </div>
 
-          {lowStockProducts.length === 0 ? (
-            <div className="h-[140px] flex flex-col items-center justify-center text-stone-500 space-y-1 border border-dashed border-stone-800 rounded-xl bg-stone-950/20">
-              <Package className="h-6 w-6 text-stone-600" />
-              <p className="text-[11px]">Tuyệt vời! Không có sản phẩm nào có mức tồn dưới định mức tối thiểu.</p>
-            </div>
-          ) : (
             <div className="space-y-3">
               <div className="h-[160px] w-full pt-1">
                 <ResponsiveContainer width="100%" height="100%">
@@ -1425,16 +1781,16 @@ export default function KiotDashboard({ products, invoices, categories, currentS
                 })}
               </div>
             </div>
-          )}
-        </div>
+          </div>
+        )}
 
         {/* Brand New Top 5 Best Selling Products Bar Chart */}
-        <div className="p-4 rounded-2xl bg-stone-900 border border-stone-850 space-y-3">
+        <div className={`p-4 rounded-2xl bg-stone-900 border border-stone-850 space-y-3 ${lowStockProducts.length === 0 ? "lg:col-span-2" : ""}`}>
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-stone-850 pb-2">
             <div className="space-y-0.5">
               <h3 className="text-xs font-bold text-stone-100 uppercase tracking-wider flex items-center gap-1.5 text-emerald-400">
                 <ShoppingBag className="h-4 w-4 text-emerald-400" />
-                <span>Top 5 sản phẩm bán chạy nhất (Doanh thu & Số lượng)</span>
+                <span>Top 5 sản phẩm bán chạy nhất (Doanh thu &amp; Số lượng)</span>
               </h3>
               <p className="text-[9px] text-stone-400">
                 Theo dõi hiệu suất bán ra và nguồn thu lớn nhất trong khoảng thời gian đã chọn.
@@ -1453,55 +1809,507 @@ export default function KiotDashboard({ products, invoices, categories, currentS
               <p className="text-[11px]">Chưa có giao dịch bán hàng nào được ghi nhận trong thời kỳ này.</p>
             </div>
           ) : (
-            <div className="space-y-3">
-              <div className="h-[160px] w-full pt-1">
-                <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={topSellingChartData} margin={{ top: 5, right: 5, left: -20, bottom: 0 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#262626" />
-                    <XAxis dataKey="name" stroke="#a3a3a3" fontSize={9} tickLine={false} />
-                    <YAxis yAxisId="left" stroke="#10b981" fontSize={8} tickLine={false} axisLine={false} tickFormatter={(val) => val >= 1000000 ? `${(val / 1000000).toFixed(1)}M` : val >= 1000 ? `${(val / 1000).toFixed(0)}k` : val} />
-                    <YAxis yAxisId="right" orientation="right" stroke="#0ea5e9" fontSize={8} tickLine={false} axisLine={false} />
-                    <Tooltip 
-                      contentStyle={{ backgroundColor: "#1c1917", borderColor: "#44403c", borderRadius: "10px", color: "#e5e5e5", fontSize: "11px" }}
-                      formatter={(value: any, name: string) => {
-                        if (name === "Doanh thu") return [formatVND(value), name];
-                        return [`${value} sản phẩm`, name];
-                      }}
-                    />
-                    <Legend verticalAlign="top" height={24} wrapperStyle={{ fontSize: '10px' }} />
-                    <Bar yAxisId="left" name="Doanh thu" dataKey="Doanh thu" fill="#10b981" radius={[4, 4, 0, 0]} />
-                    <Bar yAxisId="right" name="Số lượng" dataKey="Số lượng" fill="#0ea5e9" radius={[4, 4, 0, 0]} />
-                  </BarChart>
-                </ResponsiveContainer>
+            <div className="grid grid-cols-1 xl:grid-cols-5 gap-5">
+              {/* Left Column: Chart */}
+              <div className="xl:col-span-3 space-y-1">
+                <div className="h-[160px] w-full pt-1">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={topSellingChartData} margin={{ top: 5, right: 5, left: -20, bottom: 0 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#262626" />
+                      <XAxis dataKey="name" stroke="#a3a3a3" fontSize={9} tickLine={false} />
+                      <YAxis yAxisId="left" stroke="#10b981" fontSize={8} tickLine={false} axisLine={false} tickFormatter={(val) => val >= 1000000 ? `${(val / 1000000).toFixed(1)}M` : val >= 1000 ? `${(val / 1000).toFixed(0)}k` : val} />
+                      <YAxis yAxisId="right" orientation="right" stroke="#0ea5e9" fontSize={8} tickLine={false} axisLine={false} />
+                      <Tooltip 
+                        contentStyle={{ backgroundColor: "#1c1917", borderColor: "#44403c", borderRadius: "10px", color: "#e5e5e5", fontSize: "11px" }}
+                        formatter={(value: any, name: string) => {
+                          if (name === "Doanh thu") return [formatVND(value), name];
+                          return [`${value} sản phẩm`, name];
+                        }}
+                      />
+                      <Legend verticalAlign="top" height={24} wrapperStyle={{ fontSize: '10px' }} />
+                      <Bar yAxisId="left" name="Doanh thu" dataKey="Doanh thu" fill="#10b981" radius={[4, 4, 0, 0]} />
+                      <Bar yAxisId="right" name="Số lượng" dataKey="Số lượng" fill="#0ea5e9" radius={[4, 4, 0, 0]} />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
               </div>
               
-              <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 pt-1">
-                {topSellingChartData.map((prod, idx) => {
-                  return (
-                    <div key={idx} className="p-2.5 rounded-xl bg-stone-950/40 border border-stone-850 space-y-1 hover:border-stone-700 transition-all flex flex-col justify-between">
-                      <div className="space-y-0.5">
-                        <span className="text-[9px] font-mono text-stone-300 block truncate" title={prod.fullName}>
-                          {prod.fullName}
-                        </span>
-                        <span className="text-[8px] text-stone-500 block leading-none font-mono">{prod.code}</span>
+              {/* Right Column: High-density Details Table */}
+              <div className="xl:col-span-2 flex flex-col justify-between p-3 rounded-xl bg-stone-950/40 border border-stone-850/85 space-y-2 select-none">
+                <span className="text-[10px] font-bold text-stone-400 uppercase tracking-wider block border-b border-stone-850 pb-1.5">
+                  Bảng chi tiết số liệu
+                </span>
+                <div className="space-y-2 overflow-y-auto max-h-[140px] pr-1 scrollbar-thin">
+                  {topSellingChartData.map((prod, idx) => (
+                    <div key={idx} className="flex items-center justify-between text-xs py-1 border-b border-stone-900/40 last:border-0 hover:bg-stone-900/30 px-1 rounded transition-all">
+                      <div className="truncate max-w-[130px]">
+                        <span className="text-[10px] font-bold text-stone-500 font-mono mr-1.5">#{idx + 1}</span>
+                        <span className="font-semibold text-stone-200" title={prod.fullName}>{prod.fullName}</span>
                       </div>
-                      <div className="pt-1 border-t border-stone-900 mt-1">
-                        <div className="flex items-baseline justify-between">
-                          <span className="text-[9px] font-black text-emerald-400 font-mono">
-                            {formatVND(prod["Doanh thu"])}
-                          </span>
-                        </div>
-                        <div className="flex items-center justify-between text-[8px] text-stone-500 font-bold mt-0.5">
-                          <span>Đã bán:</span>
-                          <span className="text-sky-400 font-mono">{prod["Số lượng"]} cái</span>
-                        </div>
+                      <div className="text-right">
+                        <span className="font-bold text-emerald-400 font-mono text-[11px] block">{formatVND(prod["Doanh thu"])}</span>
+                        <span className="text-[9px] text-stone-400 font-mono">Đã bán: <strong className="text-sky-400">{prod["Số lượng"]}</strong> cái</span>
                       </div>
                     </div>
-                  );
-                })}
+                  ))}
+                </div>
               </div>
             </div>
           )}
+        </div>
+      </div>
+
+      {/* TRUNG TÂM BÁO CÁO & PHÂN TÍCH CHUYÊN SÂU */}
+      <div className="p-6 rounded-2xl bg-stone-900 border border-stone-850 hover:border-indigo-500/20 transition-all space-y-6 relative overflow-hidden">
+        <div className="absolute top-0 right-0 h-40 w-40 bg-indigo-500/5 rounded-full blur-3xl pointer-events-none" />
+        
+        {/* Header */}
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-stone-850 pb-4">
+          <div className="space-y-1">
+            <h3 className="text-sm font-black text-stone-100 flex items-center gap-2 uppercase tracking-widest text-indigo-400">
+              <Sparkles className="h-5 w-5 text-indigo-400" />
+              <span>TRUNG TÂM BÁO CÁO & PHÂN TÍCH CHUYÊN SÂU</span>
+            </h3>
+            <p className="text-xs text-stone-400">
+              Hệ thống truy xuất dữ liệu kinh doanh đa chiều, phân tích tài chính tổng hợp, thống kê dòng tiền và đánh giá năng lực nhân sự theo mốc thời gian tùy biến.
+            </p>
+          </div>
+          <button
+            onClick={handleExportAdvancedReportToExcel}
+            className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 active:scale-95 text-white font-bold rounded-xl transition-all cursor-pointer text-xs uppercase tracking-wider flex items-center gap-1.5 shadow-lg shadow-indigo-600/10 self-start md:self-auto"
+          >
+            <Download className="h-4 w-4" />
+            <span>Xuất Excel chuyên đề (.xlsx)</span>
+          </button>
+        </div>
+
+        {/* Filters and Tab Navigation Controls */}
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
+          {/* Left Column: Local report configuration and periods */}
+          <div className="lg:col-span-4 p-4 rounded-xl bg-stone-950/60 border border-stone-850 space-y-4">
+            <h4 className="text-xs font-black text-stone-300 uppercase tracking-wider flex items-center gap-1.5 border-b border-stone-850 pb-2">
+              <Filter className="h-3.5 w-3.5 text-indigo-400" />
+              <span>Cấu hình tham số báo cáo</span>
+            </h4>
+
+            {/* Step 1: Select Report Category Tab */}
+            <div className="space-y-1.5">
+              <label className="text-[10px] text-stone-500 font-bold uppercase tracking-wider block">1. Chủ đề báo cáo</label>
+              <div className="grid grid-cols-2 gap-1.5">
+                {[
+                  { key: "summary", label: "Tổng hợp" },
+                  { key: "time", label: "Ngày/Tháng/Năm" },
+                  { key: "cashier", label: "Nhân viên" },
+                  { key: "category", label: "Nhóm hàng" }
+                ].map(tab => (
+                  <button
+                    key={tab.key}
+                    onClick={() => setRepTab(tab.key as any)}
+                    className={`py-2 px-3 rounded-xl text-xs font-bold transition-all cursor-pointer border text-center ${
+                      repTab === tab.key
+                        ? "bg-indigo-500/10 text-indigo-400 border-indigo-500/40 font-black shadow-md"
+                        : "bg-stone-900/40 text-stone-400 border-stone-850 hover:bg-stone-900 hover:text-stone-300"
+                    }`}
+                  >
+                    {tab.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Dynamic Sync Info Badge */}
+            <div className="p-4 rounded-xl bg-indigo-500/5 border border-indigo-500/15 space-y-2 text-stone-300">
+              <div className="flex items-center gap-1.5 text-[10px] font-black text-indigo-400 uppercase tracking-widest">
+                <Sparkles className="h-3.5 w-3.5" />
+                <span>Đồng bộ Header Filter</span>
+              </div>
+              <p className="text-[10px] text-stone-400 leading-relaxed">
+                Các chỉ số báo cáo bên dưới được tự động liên kết và đồng bộ trực tiếp với bộ lọc chính ở đầu trang để tránh trùng lặp dữ liệu.
+              </p>
+              <div className="space-y-1.5 text-[10.5px] font-mono border-t border-indigo-500/10 pt-2.5 mt-2">
+                <div className="flex justify-between">
+                  <span className="text-stone-500">Mốc thời gian:</span>
+                  <span className="text-emerald-400 font-bold uppercase">
+                    {dateFilterType === "today" 
+                      ? "Hôm nay" 
+                      : dateFilterType === "yesterday" 
+                      ? "Hôm qua" 
+                      : dateFilterType === "7days" 
+                      ? "7 ngày qua" 
+                      : dateFilterType === "30days" 
+                      ? "Tháng này" 
+                      : dateFilterType === "custom" 
+                      ? "Chọn khoảng ngày" 
+                      : "Tất cả"}
+                  </span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-stone-500">Người thực hiện:</span>
+                  <span className="text-indigo-400 font-bold">
+                    {dashboardStaffFilter === "all" ? "Tất cả nhân viên" : dashboardStaffFilter}
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            {/* Step 4: Special inputs if in Chronological (Time) tab */}
+            {repTab === "time" && (
+              <div className="space-y-3 border-t border-stone-850 pt-3">
+                <div className="space-y-1">
+                  <label className="text-[10px] text-stone-500 font-bold uppercase block">4. Quy mô gom nhóm thời gian</label>
+                  <div className="grid grid-cols-3 gap-1 bg-stone-900 p-1 rounded-lg border border-stone-800">
+                    {[
+                      { key: "day", label: "Theo Ngày" },
+                      { key: "month", label: "Theo Tháng" },
+                      { key: "year", label: "Theo Năm" }
+                    ].map(type => (
+                      <button
+                        key={type.key}
+                        onClick={() => setRepChronologicalType(type.key as any)}
+                        className={`py-1 rounded text-[10px] font-bold cursor-pointer transition-all ${
+                          repChronologicalType === type.key
+                            ? "bg-indigo-600 text-white font-black"
+                            : "text-stone-400 hover:bg-stone-800"
+                        }`}
+                      >
+                        {type.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {repChronologicalType === "day" && (
+                  <div className="space-y-1.5">
+                    <label className="text-[10px] text-stone-400 font-bold uppercase block">Chọn tháng & năm để xem theo ngày</label>
+                    <input
+                      type="month"
+                      value={repMonth}
+                      onChange={(e) => setRepMonth(e.target.value)}
+                      className="w-full px-3 py-2 bg-stone-900 border border-stone-800 rounded-xl text-stone-200 text-xs focus:outline-none focus:border-indigo-500 font-mono"
+                    />
+                  </div>
+                )}
+
+                {repChronologicalType === "month" && (
+                  <div className="space-y-1.5">
+                    <label className="text-[10px] text-stone-400 font-bold uppercase block">Chọn năm để xem các tháng</label>
+                    <select
+                      value={repYear}
+                      onChange={(e) => setRepYear(e.target.value)}
+                      className="w-full px-3 py-2 bg-stone-900 border border-stone-800 rounded-xl text-stone-200 text-xs focus:outline-none focus:border-indigo-500 font-mono cursor-pointer"
+                    >
+                      <option value="2024">Năm 2024</option>
+                      <option value="2025">Năm 2025</option>
+                      <option value="2026">Năm 2026</option>
+                      <option value="2027">Năm 2027</option>
+                    </select>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Right Column: Display charts & tables for active reporting category */}
+          <div className="lg:col-span-8 space-y-4">
+            
+            {/* 1. COMPREHENSIVE SUMMARY TAB VIEW */}
+            {repTab === "summary" && (
+              <div className="space-y-4 animate-fade-in">
+                {/* Visual Cards Grid */}
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                  <div className="p-3 rounded-xl bg-stone-950/40 border border-stone-850/80">
+                    <p className="text-[10px] text-stone-400 uppercase font-bold">Doanh số thuần</p>
+                    <h5 className="text-sm font-black font-mono text-emerald-400 mt-1">{formatVND(reportStats.revenue)}</h5>
+                  </div>
+                  <div className="p-3 rounded-xl bg-stone-950/40 border border-stone-850/80">
+                    <p className="text-[10px] text-stone-400 uppercase font-bold">Số hóa đơn</p>
+                    <h5 className="text-sm font-black font-mono text-indigo-400 mt-1">{reportStats.transactions} đơn</h5>
+                  </div>
+                  <div className="p-3 rounded-xl bg-stone-950/40 border border-stone-850/80">
+                    <p className="text-[10px] text-stone-400 uppercase font-bold">Giá trị trung bình đơn</p>
+                    <h5 className="text-sm font-black font-mono text-sky-400 mt-1">
+                      {formatVND(reportStats.transactions > 0 ? reportStats.revenue / reportStats.transactions : 0)}
+                    </h5>
+                  </div>
+                  <div className="p-3 rounded-xl bg-stone-950/40 border border-stone-850/80">
+                    <p className="text-[10px] text-stone-400 uppercase font-bold">Lợi nhuận gộp</p>
+                    <h5 className="text-sm font-black font-mono text-amber-500 mt-1">
+                      {currentStaff?.role === "OWNER" ? formatVND(reportStats.profit) : "Bảo mật"}
+                    </h5>
+                  </div>
+                </div>
+
+                {/* Analytical details card */}
+                <div className="p-4 rounded-xl bg-stone-950/30 border border-stone-850">
+                  <div className="flex items-center justify-between border-b border-stone-850 pb-2 mb-3">
+                    <h5 className="text-[11px] font-black text-stone-200 uppercase tracking-wide">Chi tiết tài chính bổ sung</h5>
+                    <span className="text-[10px] text-indigo-400 font-mono">Tỉ suất LN gộp: {reportStats.margin.toFixed(1)}%</span>
+                  </div>
+                  
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-2 text-xs">
+                    <div className="flex justify-between py-1 border-b border-stone-850/30">
+                      <span className="text-stone-400">Doanh thu gộp (chưa trừ chiết khấu)</span>
+                      <span className="font-semibold text-stone-200 font-mono">{formatVND(reportStats.revenue + reportStats.discount)}</span>
+                    </div>
+                    <div className="flex justify-between py-1 border-b border-stone-850/30">
+                      <span className="text-stone-400">Tổng chiết khấu / giảm giá</span>
+                      <span className="font-semibold text-rose-400 font-mono">-{formatVND(reportStats.discount)}</span>
+                    </div>
+                    <div className="flex justify-between py-1 border-b border-stone-850/30">
+                      <span className="text-stone-400">Giá vốn hàng bán (COGS)</span>
+                      <span className="font-semibold text-stone-300 font-mono">
+                        {currentStaff?.role === "OWNER" ? formatVND(reportStats.cost) : "Bảo mật"}
+                      </span>
+                    </div>
+                    <div className="flex justify-between py-1 border-b border-stone-850/30">
+                      <span className="text-stone-400">Thuế GTGT / VAT đã thu</span>
+                      <span className="font-semibold text-stone-300 font-mono">{formatVND(reportStats.revenue * 0.08)}</span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Mini chart of reportFilteredInvoices timeline */}
+                <div className="p-4 rounded-xl bg-stone-950/20 border border-stone-850 space-y-3">
+                  <h5 className="text-[10px] font-black text-stone-300 uppercase tracking-wider">Xu hướng dòng tiền bán ra (Hóa đơn)</h5>
+                  {reportFilteredInvoices.length === 0 ? (
+                    <div className="h-32 flex items-center justify-center text-stone-600 text-xs">Chưa có hóa đơn nào để lập biểu đồ.</div>
+                  ) : (
+                    <div className="h-44 w-full">
+                      <ResponsiveContainer width="100%" height="100%">
+                        <AreaChart data={reportFilteredInvoices.slice().sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime()).map(inv => ({
+                          time: new Date(inv.date).toLocaleDateString("vi-VN", { day: "numeric", month: "numeric" }),
+                          "Doanh thu": inv.totalPayable
+                        }))} margin={{ top: 5, right: 5, left: -20, bottom: 0 }}>
+                          <defs>
+                            <linearGradient id="repColorRev" x1="0" y1="0" x2="0" y2="1">
+                              <stop offset="5%" stopColor="#6366f1" stopOpacity={0.2}/>
+                              <stop offset="95%" stopColor="#6366f1" stopOpacity={0}/>
+                            </linearGradient>
+                          </defs>
+                          <CartesianGrid strokeDasharray="3 3" stroke="#262626" />
+                          <XAxis dataKey="time" stroke="#737373" fontSize={9} />
+                          <YAxis stroke="#6366f1" fontSize={8} tickFormatter={(v) => v >= 1000000 ? `${v / 1000000}M` : `${v / 1000}k`} />
+                          <Tooltip contentStyle={{ backgroundColor: "#1c1917", borderColor: "#44403c" }} />
+                          <Area type="monotone" dataKey="Doanh thu" stroke="#6366f1" strokeWidth={2} fillOpacity={1} fill="url(#repColorRev)" />
+                        </AreaChart>
+                      </ResponsiveContainer>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* 2. CHRONOLOGICAL DAYS, MONTHS, YEARS TIMELINE REPORT */}
+            {repTab === "time" && (
+              <div className="space-y-4 animate-fade-in">
+                <div className="p-4 rounded-xl bg-stone-950/20 border border-stone-850">
+                  <div className="flex items-center justify-between border-b border-stone-850 pb-2 mb-3">
+                    <h5 className="text-[11px] font-black text-stone-200 uppercase tracking-wide">
+                      Biểu đồ doanh thu {repChronologicalType === "day" ? `tháng ${repMonth}` : repChronologicalType === "month" ? `năm ${repYear}` : "toàn hệ thống"}
+                    </h5>
+                    <span className="text-[9px] text-indigo-400 bg-indigo-500/10 px-2 py-0.5 rounded border border-indigo-500/20 uppercase font-black">
+                      {repChronologicalType === "day" ? "Chia theo Ngày" : repChronologicalType === "month" ? "Chia theo Tháng" : "Chia theo Năm"}
+                    </span>
+                  </div>
+
+                  <div className="h-44 w-full">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <BarChart 
+                        data={
+                          repChronologicalType === "day" 
+                            ? chronologicalDailyData 
+                            : repChronologicalType === "month" 
+                            ? chronologicalMonthlyData 
+                            : chronologicalYearlyData
+                        } 
+                        margin={{ top: 5, right: 5, left: -20, bottom: 0 }}
+                      >
+                        <CartesianGrid strokeDasharray="3 3" stroke="#262626" />
+                        <XAxis 
+                          dataKey={repChronologicalType === "day" ? "dateStr" : repChronologicalType === "month" ? "monthStr" : "yearStr"} 
+                          stroke="#737373" 
+                          fontSize={8} 
+                        />
+                        <YAxis stroke="#818cf8" fontSize={8} tickFormatter={(v) => v >= 1000000 ? `${v / 1000000}M` : `${v / 1000}k`} />
+                        <Tooltip contentStyle={{ backgroundColor: "#1c1917", borderColor: "#44403c" }} formatter={(value: any) => [formatVND(value), "Doanh thu"]} />
+                        <Bar name="Doanh thu" dataKey="revenue" fill="#6366f1" radius={[2, 2, 0, 0]} />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+
+                {/* Timeline data grid table */}
+                <div className="overflow-x-auto rounded-xl border border-stone-850 bg-stone-950/30 max-h-[220px] overflow-y-auto">
+                  <table className="w-full text-left text-xs border-collapse">
+                    <thead>
+                      <tr className="border-b border-stone-800 bg-stone-950 text-stone-400 sticky top-0">
+                        <th className="py-2 px-3 font-bold uppercase">{repChronologicalType === "day" ? "Ngày" : repChronologicalType === "month" ? "Tháng" : "Năm"}</th>
+                        <th className="py-2 px-3 text-center font-bold uppercase">Số hóa đơn</th>
+                        <th className="py-2 px-3 text-right font-bold uppercase">Tổng doanh thu</th>
+                        {currentStaff?.role === "OWNER" && (
+                          <>
+                            <th className="py-2 px-3 text-right font-bold uppercase">Tổng giá vốn</th>
+                            <th className="py-2 px-3 text-right font-bold uppercase">Lợi nhuận ròng</th>
+                          </>
+                        )}
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-stone-850/50">
+                      {(repChronologicalType === "day" ? chronologicalDailyData : repChronologicalType === "month" ? chronologicalMonthlyData : chronologicalYearlyData).filter(item => item.revenue > 0).length === 0 ? (
+                        <tr>
+                          <td colSpan={5} className="py-6 text-center text-stone-500">Không có dữ liệu giao dịch phát sinh trong kỳ này.</td>
+                        </tr>
+                      ) : (
+                        (repChronologicalType === "day" ? chronologicalDailyData : repChronologicalType === "month" ? chronologicalMonthlyData : chronologicalYearlyData)
+                          .filter(item => item.revenue > 0 || item.transactions > 0)
+                          .map((item: any, idx) => (
+                            <tr key={idx} className="hover:bg-stone-900/30 transition-colors">
+                              <td className="py-2 px-3 font-semibold text-stone-200">
+                                {repChronologicalType === "day" ? item.dateStr : repChronologicalType === "month" ? item.monthStr : item.yearStr}
+                              </td>
+                              <td className="py-2 px-3 text-center font-bold text-stone-350">{item.transactions} đơn</td>
+                              <td className="py-2 px-3 text-right font-bold text-emerald-400 font-mono">{formatVND(item.revenue)}</td>
+                              {currentStaff?.role === "OWNER" && (
+                                <>
+                                  <td className="py-2 px-3 text-right font-mono text-stone-400">{formatVND(item.cost)}</td>
+                                  <td className="py-2 px-3 text-right font-bold font-mono text-indigo-400">{formatVND(item.profit)}</td>
+                                </>
+                              )}
+                            </tr>
+                          ))
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {/* 3. DETAILED EMPLOYEE PERFORMANCE COMPARISON */}
+            {repTab === "cashier" && (
+              <div className="space-y-4 animate-fade-in">
+                <div className="overflow-x-auto rounded-xl border border-stone-850 bg-stone-950/30">
+                  <table className="w-full text-left text-xs border-collapse">
+                    <thead>
+                      <tr className="border-b border-stone-800 bg-stone-950 text-stone-400">
+                        <th className="py-3 px-3 font-bold uppercase text-left">Nhân viên thu ngân</th>
+                        <th className="py-3 px-3 text-center font-bold uppercase">Số hóa đơn</th>
+                        <th className="py-3 px-3 text-center font-bold uppercase">Sản phẩm bán</th>
+                        <th className="py-3 px-3 text-right font-bold uppercase">Tổng Doanh thu</th>
+                        <th className="py-3 px-3 text-right font-bold uppercase">Ước tính hoa hồng</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-stone-850/50">
+                      {detailedEmployeePerformance.length === 0 ? (
+                        <tr>
+                          <td colSpan={5} className="py-8 text-center text-stone-500">Chưa có hóa đơn nào phát sinh của nhân viên.</td>
+                        </tr>
+                      ) : (
+                        detailedEmployeePerformance.map((item, idx) => {
+                          const totalRev = reportStats.revenue || 1;
+                          const ratio = (item.totalRevenue / totalRev) * 100;
+
+                          return (
+                            <tr key={idx} className="hover:bg-stone-900/30 transition-colors">
+                              <td className="py-3 px-3 font-semibold text-stone-200">
+                                <div className="flex items-center gap-2">
+                                  <div className="h-6 w-6 rounded-full bg-indigo-500/10 text-indigo-400 border border-indigo-500/25 flex items-center justify-center font-black font-mono text-[9px]">
+                                    {idx + 1}
+                                  </div>
+                                  <div>
+                                    <p className="font-bold text-stone-200">{item.name}</p>
+                                    <p className="text-[9px] text-stone-500 uppercase tracking-widest">{item.role}</p>
+                                  </div>
+                                </div>
+                              </td>
+                              <td className="py-3 px-3 text-center font-bold font-mono text-stone-300">{item.invoiceCount} đơn</td>
+                              <td className="py-3 px-3 text-center font-mono text-stone-400">{item.itemsSold} cái</td>
+                              <td className="py-3 px-3 text-right font-bold text-emerald-400 font-mono">
+                                <div>{formatVND(item.totalRevenue)}</div>
+                                <div className="text-[9px] text-stone-500">Đóng góp: {ratio.toFixed(1)}%</div>
+                              </td>
+                              <td className="py-3 px-3 text-right font-mono font-bold text-indigo-400">
+                                {formatVND(item.commissionEarned)}
+                              </td>
+                            </tr>
+                          );
+                        })
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {/* 4. PRODUCT GROUP / CATEGORY CONTRIBUTION REPORT */}
+            {repTab === "category" && (
+              <div className="space-y-4 animate-fade-in">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {/* Category revenue percentage table */}
+                  <div className="overflow-x-auto rounded-xl border border-stone-850 bg-stone-950/30 p-3">
+                    <h5 className="text-[10px] font-black text-stone-300 uppercase tracking-wider mb-2">Thống kê theo Nhóm hàng</h5>
+                    <table className="w-full text-left text-[11px] border-collapse">
+                      <thead>
+                        <tr className="border-b border-stone-800 text-stone-500">
+                          <th className="pb-1.5 font-bold uppercase">Nhóm hàng</th>
+                          <th className="pb-1.5 text-center font-bold uppercase">Lượng bán</th>
+                          <th className="pb-1.5 text-right font-bold uppercase">Doanh thu</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-stone-850/30">
+                        {detailedCategorySales.length === 0 ? (
+                          <tr>
+                            <td colSpan={3} className="py-6 text-center text-stone-600">Chưa ghi nhận doanh thu nhóm hàng nào.</td>
+                          </tr>
+                        ) : (
+                          detailedCategorySales.map((item, idx) => (
+                            <tr key={idx} className="hover:bg-stone-900/10 transition-colors">
+                              <td className="py-2 font-bold text-stone-300">{item.category}</td>
+                              <td className="py-2 text-center text-stone-400 font-mono">{item.quantitySold} cái</td>
+                              <td className="py-2 text-right font-bold text-emerald-400 font-mono">{formatVND(item.revenue)}</td>
+                            </tr>
+                          ))
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  {/* Recharts Pie chart representation */}
+                  <div className="p-3 rounded-xl border border-stone-850 bg-stone-950/20 flex flex-col justify-between">
+                    <h5 className="text-[10px] font-black text-stone-300 uppercase tracking-wider mb-2">Biểu đồ đóng góp cơ cấu ngành hàng</h5>
+                    {detailedCategorySales.length === 0 ? (
+                      <div className="h-32 flex items-center justify-center text-stone-600 text-xs">Không có dữ liệu đóng góp.</div>
+                    ) : (
+                      <div className="h-32 w-full flex items-center justify-center">
+                        <ResponsiveContainer width="100%" height="100%">
+                          <PieChart>
+                            <Pie
+                              data={detailedCategorySales}
+                              dataKey="revenue"
+                              nameKey="category"
+                              cx="50%"
+                              cy="50%"
+                              outerRadius={45}
+                              fill="#8884d8"
+                              label={({ name, percent }) => `${name} (${(percent * 100).toFixed(0)}%)`}
+                              labelLine={false}
+                              fontSize={8}
+                            >
+                              {detailedCategorySales.map((entry, index) => {
+                                const colors = ["#6366f1", "#10b981", "#f59e0b", "#3b82f6", "#ec4899", "#14b8a6"];
+                                return <Cell key={`cell-${index}`} fill={colors[index % colors.length]} />;
+                              })}
+                            </Pie>
+                            <Tooltip formatter={(value: any) => [formatVND(value), "Doanh thu"]} />
+                          </PieChart>
+                        </ResponsiveContainer>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+            
+          </div>
         </div>
       </div>
 
@@ -1590,93 +2398,7 @@ export default function KiotDashboard({ products, invoices, categories, currentS
         </div>
       </div>
 
-      {/* Bảng đánh giá hiệu suất nhân viên thu ngân */}
-      <div className="p-5 rounded-2xl bg-stone-900 border border-stone-850 space-y-4 relative overflow-hidden">
-        <div className="absolute top-0 right-0 h-32 w-32 bg-indigo-500/5 rounded-full blur-3xl pointer-events-none" />
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-stone-850 pb-3">
-          <div className="space-y-1">
-            <h3 className="text-xs font-black text-stone-100 flex items-center gap-2 uppercase tracking-wider">
-              <Users className="h-4 w-4 text-indigo-400" />
-              <span>Bảng đánh giá hiệu suất nhân viên thu ngân</span>
-            </h3>
-            <p className="text-[11px] text-stone-400">
-              Chi tiết doanh số bán hàng, số lượng hóa đơn lập và mức độ đóng góp doanh thu của từng thu ngân trong kỳ báo cáo hoạt động hiện tại.
-            </p>
-          </div>
-          <span className="text-[10px] text-indigo-400 bg-indigo-500/10 font-black px-2 py-1 rounded-lg border border-indigo-500/15 uppercase tracking-widest self-start sm:self-auto flex items-center gap-1">
-            <Activity className="h-3 w-3 text-indigo-400 animate-pulse" />
-            <span>Xếp hạng doanh thu</span>
-          </span>
-        </div>
 
-        <div className="overflow-x-auto">
-          <table className="w-full text-left text-xs border-collapse">
-            <thead>
-              <tr className="text-stone-400 border-b border-stone-850">
-                <th className="pb-3 font-bold uppercase tracking-wider text-left">Nhân viên thu ngân</th>
-                <th className="pb-3 text-center font-bold uppercase tracking-wider">Số hóa đơn</th>
-                <th className="pb-3 text-center font-bold uppercase tracking-wider">Sản phẩm đã bán</th>
-                <th className="pb-3 text-right font-bold uppercase tracking-wider">Doanh số thu được</th>
-                <th className="pb-3 text-right font-bold uppercase tracking-wider">Giá trị đơn TB</th>
-                <th className="pb-3 text-right font-bold uppercase tracking-wider pl-4">Đóng góp doanh thu</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-stone-850/60">
-              {cashierPerformance.length === 0 ? (
-                <tr>
-                  <td colSpan={6} className="py-8 text-center text-stone-500">
-                    Chưa có dữ liệu giao dịch của nhân viên nào trong thời kỳ này.
-                  </td>
-                </tr>
-              ) : (
-                cashierPerformance.map((item, idx) => {
-                  const totalStoreRevenue = stats.revenue || 1;
-                  const contributionPercent = (item.revenue / totalStoreRevenue) * 100;
-                  
-                  return (
-                    <tr key={item.name} className="hover:bg-stone-950/40 transition-colors">
-                      <td className="py-3 font-semibold text-stone-200 flex items-center gap-2">
-                        <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-stone-850 text-stone-300 border border-stone-800 text-[10px] font-black font-mono">
-                          {idx + 1}
-                        </div>
-                        <div>
-                          <p className="font-bold text-stone-100">{item.name}</p>
-                          <p className="text-[9px] text-stone-500">Thành viên bán hàng</p>
-                        </div>
-                      </td>
-                      <td className="py-3 text-center font-bold font-mono text-stone-300">
-                        {item.invoiceCount} đơn
-                      </td>
-                      <td className="py-3 text-center font-bold font-mono text-stone-300">
-                        {item.itemsSold} cái
-                      </td>
-                      <td className="py-3 text-right font-bold font-mono text-emerald-400">
-                        {formatVND(item.revenue)}
-                      </td>
-                      <td className="py-3 text-right font-mono text-stone-400">
-                        {formatVND(item.avgInvoiceValue)}
-                      </td>
-                      <td className="py-3 text-right pl-4">
-                        <div className="flex flex-col items-end gap-1 min-w-[120px]">
-                          <span className="font-mono text-[10px] font-black text-indigo-400">
-                            {contributionPercent.toFixed(1)}%
-                          </span>
-                          <div className="w-24 bg-stone-800 h-1.5 rounded-full overflow-hidden">
-                            <div 
-                              className="h-full bg-indigo-500 rounded-full" 
-                              style={{ width: `${contributionPercent}%` }}
-                            />
-                          </div>
-                        </div>
-                      </td>
-                    </tr>
-                  );
-                })
-              )}
-            </tbody>
-          </table>
-        </div>
-      </div>
 
       {/* TRUNG TÂM DỌN DẸP & XÓA BÁO CÁO (DỮ LIỆU GIAO DỊCH) */}
       {!isDeleteSectionRevealed ? (
@@ -1831,44 +2553,38 @@ export default function KiotDashboard({ products, invoices, categories, currentS
         </div>
       )}
 
-      {/* Low stock & Top Sellers columns */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-        {/* Out of Stock alerts table */}
-        <div className="p-5 rounded-2xl bg-stone-900 border border-stone-850 space-y-4">
-          <div className="flex items-center justify-between">
-            <h3 className="text-sm font-bold text-stone-100 uppercase tracking-wider flex items-center gap-1.5 text-rose-400">
-              <AlertTriangle className="h-4.5 w-4.5" />
-              <span>Sản phẩm dưới định mức tối thiểu ({lowStockProducts.length})</span>
-            </h3>
-            <button 
-              onClick={() => onNavigateToTab("products")}
-              className="text-[10px] font-black text-amber-500 hover:text-amber-400 uppercase tracking-wider flex items-center gap-0.5"
-            >
-              Nhập hàng
-              <ChevronRight className="h-3 w-3" />
-            </button>
-          </div>
+      {/* Low stock column */}
+      {lowStockProducts.length > 0 && (
+        <div className="grid grid-cols-1 gap-6">
+          {/* Out of Stock alerts table */}
+          <div className="p-5 rounded-2xl bg-stone-900 border border-stone-850 space-y-4">
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-bold text-stone-100 uppercase tracking-wider flex items-center gap-1.5 text-rose-400">
+                <AlertTriangle className="h-4.5 w-4.5" />
+                <span>Sản phẩm dưới định mức tối thiểu ({lowStockProducts.length})</span>
+              </h3>
+              <button 
+                onClick={() => onNavigateToTab("products")}
+                className="text-[10px] font-black text-amber-500 hover:text-amber-400 uppercase tracking-wider flex items-center gap-0.5"
+              >
+                Nhập hàng
+                <ChevronRight className="h-3 w-3" />
+              </button>
+            </div>
 
-          <div className="overflow-x-auto max-h-[250px] overflow-y-auto pr-1">
-            <table className="w-full text-left text-xs border-collapse">
-              <thead className="sticky top-0 bg-stone-900 z-10 shadow-[0_1px_0_0_#262626]">
-                <tr className="text-stone-400">
-                  <th className="pb-2 font-bold uppercase tracking-wider bg-stone-900">Mã hàng</th>
-                  <th className="pb-2 font-bold uppercase tracking-wider bg-stone-900">Tên sản phẩm</th>
-                  <th className="pb-2 text-right font-bold uppercase tracking-wider bg-stone-900">Còn lại</th>
-                  <th className="pb-2 text-right font-bold uppercase tracking-wider bg-stone-900">Đơn vị</th>
-                  <th className="pb-2 text-right font-bold uppercase tracking-wider bg-stone-900">Thao tác</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-stone-850/60">
-                {lowStockProducts.length === 0 ? (
-                  <tr>
-                    <td colSpan={5} className="py-8 text-center text-stone-500">
-                      Tuyệt vời! Không có sản phẩm nào sắp hết hàng.
-                    </td>
+            <div className="overflow-x-auto max-h-[250px] overflow-y-auto pr-1">
+              <table className="w-full text-left text-xs border-collapse">
+                <thead className="sticky top-0 bg-stone-900 z-10 shadow-[0_1px_0_0_#262626]">
+                  <tr className="text-stone-400">
+                    <th className="pb-2 font-bold uppercase tracking-wider bg-stone-900">Mã hàng</th>
+                    <th className="pb-2 font-bold uppercase tracking-wider bg-stone-900">Tên sản phẩm</th>
+                    <th className="pb-2 text-right font-bold uppercase tracking-wider bg-stone-900">Còn lại</th>
+                    <th className="pb-2 text-right font-bold uppercase tracking-wider bg-stone-900">Đơn vị</th>
+                    <th className="pb-2 text-right font-bold uppercase tracking-wider bg-stone-900">Thao tác</th>
                   </tr>
-                ) : (
-                  lowStockProducts.map(p => (
+                </thead>
+                <tbody className="divide-y divide-stone-850/60">
+                  {lowStockProducts.map(p => (
                     <tr key={p.id} className="hover:bg-stone-950/40 transition-colors">
                       <td className="py-2.5 font-mono text-stone-400">{p.code}</td>
                       <td className="py-2.5 font-semibold text-stone-200 line-clamp-1 max-w-[180px]">{p.name}</td>
@@ -1891,216 +2607,190 @@ export default function KiotDashboard({ products, invoices, categories, currentS
                         </button>
                       </td>
                     </tr>
-                  ))
-                )}
-              </tbody>
-            </table>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           </div>
         </div>
-
-        {/* Top-selling Products Table */}
-        <div className="p-5 rounded-2xl bg-stone-900 border border-stone-850 space-y-4">
-          <div className="flex items-center justify-between">
-            <h3 className="text-sm font-bold text-stone-100 uppercase tracking-wider flex items-center gap-1.5 text-emerald-400">
-              <TrendingUp className="h-4.5 w-4.5" />
-              <span>Sản phẩm bán chạy tuần này</span>
-            </h3>
-            <span className="text-[10px] text-stone-400 bg-emerald-500/10 text-emerald-400 font-bold px-2 py-0.5 rounded-full border border-emerald-500/15">
-              Doanh thu cao
-            </span>
-          </div>
-
-          <div className="overflow-x-auto max-h-[250px] overflow-y-auto pr-1">
-            <table className="w-full text-left text-xs border-collapse">
-              <thead className="sticky top-0 bg-stone-900 z-10 shadow-[0_1px_0_0_#262626]">
-                <tr className="text-stone-400">
-                  <th className="pb-2 font-bold uppercase tracking-wider bg-stone-900">Mã hàng</th>
-                  <th className="pb-2 font-bold uppercase tracking-wider bg-stone-900">Tên sản phẩm</th>
-                  <th className="pb-2 text-right font-bold uppercase tracking-wider bg-stone-900">Đã bán</th>
-                  <th className="pb-2 text-right font-bold uppercase tracking-wider bg-stone-900">Thành tiền</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-stone-850/60">
-                {topSellingProducts.length === 0 ? (
-                  <tr>
-                    <td colSpan={4} className="py-8 text-center text-stone-500">
-                      Chưa có dữ liệu bán hàng. Hãy mở POS bán sản phẩm đầu tiên!
-                    </td>
-                  </tr>
-                ) : (
-                  topSellingProducts.map(p => (
-                    <tr key={p.code} className="hover:bg-stone-950/40 transition-colors">
-                      <td className="py-2.5 font-mono text-stone-400">{p.code}</td>
-                      <td className="py-2.5 font-semibold text-stone-200 line-clamp-1 max-w-[180px]">{p.name}</td>
-                      <td className="py-2.5 text-right font-bold font-mono text-emerald-400">{p.qty} cái</td>
-                      <td className="py-2.5 text-right font-bold font-mono text-stone-100">{formatVND(p.revenue)}</td>
-                    </tr>
-                  ))
-                )}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      </div>
+      )}
 
       {/* 7. ADVANCED SALES INVOICE REGISTRY */}
       <div className="p-6 rounded-2xl bg-stone-900 border border-stone-850 space-y-5">
-        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-stone-850 pb-4">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-stone-850 pb-4">
           <div className="space-y-1">
             <h3 className="text-sm font-bold text-stone-100 flex items-center gap-2 uppercase tracking-wider">
               <FileText className="h-4.5 w-4.5 text-emerald-400" />
-              <span>Sổ Sứ Mệnh Hóa Đơn (Lịch sử giao dịch)</span>
+              <span>{showFullInvoices ? "Sổ Sứ Mệnh Hóa Đơn (Toàn bộ giao dịch)" : "Giao dịch gần đây (5 hóa đơn mới nhất)"}</span>
             </h3>
-            <p className="text-xs text-stone-400">Xem, tra cứu chi tiết và lọc tất cả hóa đơn bán lẻ trong cơ sở dữ liệu.</p>
+            <p className="text-xs text-stone-400">
+              {showFullInvoices 
+                ? "Tra cứu chi tiết, lọc nâng cao tất cả hóa đơn trong hệ thống cơ sở dữ liệu." 
+                : "Danh sách 5 hóa đơn bán lẻ vừa phát sinh thực tế tại cửa hàng."}
+            </p>
           </div>
           
-          {/* Clear Filters helper */}
-          {(searchCode || searchCustomer || searchStaff || dateFilterType !== "all" || startDate || endDate || eInvoiceFilter !== "all") && (
-            <button
-              onClick={() => {
-                setSearchCode("");
-                setSearchCustomer("");
-                setSearchStaff("");
-                setDateFilterType("all");
-                setStartDate("");
-                setEndDate("");
-                setEInvoiceFilter("all");
-              }}
-              className="px-3 py-1.5 bg-stone-800 hover:bg-stone-750 text-stone-300 text-xs font-bold rounded-lg transition-colors border border-stone-700 flex items-center gap-1.5 cursor-pointer self-start md:self-auto"
-            >
-              <RefreshCw className="h-3.5 w-3.5" />
-              <span>Xóa bộ lọc</span>
-            </button>
-          )}
-        </div>
-
-        {/* Filter Inputs Grid */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-          <div>
-            <label className="text-[10px] text-stone-400 font-bold uppercase block mb-1">Mã hóa đơn</label>
-            <div className="relative">
-              <Search className="absolute left-3 top-2.5 text-stone-500 h-4 w-4" />
-              <input
-                type="text"
-                placeholder="Tìm mã hóa đơn (e.g. HD000001)..."
-                value={searchCode}
-                onChange={(e) => setSearchCode(e.target.value)}
-                className="w-full pl-9 pr-3 py-2 bg-stone-950 border border-stone-800 text-stone-200 text-xs rounded-xl focus:outline-none focus:border-emerald-500 font-mono placeholder:text-stone-600"
-              />
-            </div>
-          </div>
-
-          <div>
-            <label className="text-[10px] text-stone-400 font-bold uppercase block mb-1">Tên khách hàng</label>
-            <div className="relative">
-              <Users className="absolute left-3 top-2.5 text-stone-500 h-4 w-4" />
-              <input
-                type="text"
-                placeholder="Tìm theo tên khách hàng..."
-                value={searchCustomer}
-                onChange={(e) => setSearchCustomer(e.target.value)}
-                className="w-full pl-9 pr-3 py-2 bg-stone-950 border border-stone-800 text-stone-200 text-xs rounded-xl focus:outline-none focus:border-emerald-500 placeholder:text-stone-600"
-              />
-            </div>
-          </div>
-
-          <div>
-            <label className="text-[10px] text-stone-400 font-bold uppercase block mb-1">Nhân viên / Thu ngân</label>
-            <div className="relative">
-              <User className="absolute left-3 top-2.5 text-stone-500 h-4 w-4" />
-              <input
-                type="text"
-                placeholder="Tìm theo tên nhân viên..."
-                value={searchStaff}
-                onChange={(e) => setSearchStaff(e.target.value)}
-                className="w-full pl-9 pr-3 py-2 bg-stone-950 border border-stone-800 text-stone-200 text-xs rounded-xl focus:outline-none focus:border-emerald-500 placeholder:text-stone-600"
-              />
-            </div>
-          </div>
-        </div>
-
-        {/* Time and Date Range selector + E-Invoice filter */}
-        <div className="grid grid-cols-1 xl:grid-cols-2 gap-4 p-4 rounded-xl bg-stone-950/40 border border-stone-850/80">
-          {/* Left: Time Filter */}
-          <div className="flex flex-col sm:flex-row sm:items-center gap-4 justify-between xl:border-r xl:border-stone-850 xl:pr-4">
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="text-[10px] text-stone-400 font-black uppercase tracking-wider mr-2">Bộ lọc thời gian:</span>
-              <div className="flex flex-wrap gap-1.5 bg-stone-950 p-1 rounded-xl border border-stone-850">
-                {[
-                  { key: "all", label: "Tất cả" },
-                  { key: "today", label: "Hôm nay" },
-                  { key: "yesterday", label: "Hôm qua" },
-                  { key: "7days", label: "7 ngày qua" },
-                  { key: "30days", label: "30 ngày qua" },
-                  { key: "custom", label: "Chọn khoảng ngày" }
-                ].map(btn => (
-                  <button
-                    key={btn.key}
-                    onClick={() => setDateFilterType(btn.key as any)}
-                    className={`px-3 py-1 text-xs font-bold rounded-lg transition-all cursor-pointer ${
-                      dateFilterType === btn.key
-                        ? "bg-emerald-500 text-stone-950 shadow-md"
-                        : "text-stone-400 hover:text-stone-250 hover:bg-stone-900"
-                    }`}
-                  >
-                    {btn.label}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            {/* Custom Date Inputs */}
-            {dateFilterType === "custom" && (
-              <div className="flex items-center gap-3 animate-fade-in">
-                <div className="flex items-center gap-1.5">
-                  <span className="text-[10px] text-stone-500 font-bold uppercase">Từ ngày:</span>
-                  <input
-                    type="date"
-                    value={startDate}
-                    onChange={(e) => setStartDate(e.target.value)}
-                    className="px-2.5 py-1 bg-stone-950 border border-stone-800 text-stone-300 text-xs rounded-lg focus:outline-none focus:border-emerald-500 font-mono"
-                  />
-                </div>
-                <div className="flex items-center gap-1.5">
-                  <span className="text-[10px] text-stone-500 font-bold uppercase">Đến ngày:</span>
-                  <input
-                    type="date"
-                    value={endDate}
-                    onChange={(e) => setEndDate(e.target.value)}
-                    className="px-2.5 py-1 bg-stone-950 border border-stone-800 text-stone-300 text-xs rounded-lg focus:outline-none focus:border-emerald-500 font-mono"
-                  />
-                </div>
-              </div>
+          <div className="flex flex-wrap items-center gap-2.5 self-start sm:self-center">
+            {/* Clear Filters helper */}
+            {showFullInvoices && (searchCode || searchCustomer || searchStaff || dateFilterType !== "all" || startDate || endDate || eInvoiceFilter !== "all") && (
+              <button
+                onClick={() => {
+                  setSearchCode("");
+                  setSearchCustomer("");
+                  setSearchStaff("");
+                  setDateFilterType("all");
+                  setStartDate("");
+                  setEndDate("");
+                  setEInvoiceFilter("all");
+                }}
+                className="px-3 py-1.5 bg-stone-800 hover:bg-stone-750 text-stone-300 text-xs font-bold rounded-lg transition-colors border border-stone-700 flex items-center gap-1.5 cursor-pointer"
+              >
+                <RefreshCw className="h-3.5 w-3.5" />
+                <span>Xóa bộ lọc</span>
+              </button>
             )}
-          </div>
-
-          {/* Right: E-Invoice Filter */}
-          <div className="flex flex-wrap items-center gap-2 xl:pl-4">
-            <span className="text-[10px] text-indigo-400 font-black uppercase tracking-wider mr-2 flex items-center gap-1">
-              <Cloud className="h-3.5 w-3.5 shrink-0" />
-              <span>Thuế & HĐ Điện Tử:</span>
-            </span>
-            <div className="flex flex-wrap gap-1.5 bg-stone-950 p-1 rounded-xl border border-stone-850">
-              {[
-                { key: "all", label: "Tất cả" },
-                { key: "issued", label: "Đã xuất HĐĐT" },
-                { key: "not_issued", label: "Chưa xuất HĐĐT" }
-              ].map(btn => (
-                <button
-                  key={btn.key}
-                  onClick={() => setEInvoiceFilter(btn.key as any)}
-                  className={`px-3 py-1 text-xs font-bold rounded-lg transition-all cursor-pointer flex items-center gap-1 ${
-                    eInvoiceFilter === btn.key
-                      ? "bg-indigo-600 text-white shadow-md font-black"
-                      : "text-stone-400 hover:text-stone-250 hover:bg-stone-900"
-                  }`}
-                >
-                  <span>{btn.label}</span>
-                </button>
-              ))}
-            </div>
+            
+            <button
+              onClick={() => setShowFullInvoices(!showFullInvoices)}
+              className="px-4 py-2 bg-emerald-500 hover:bg-emerald-400 text-stone-950 text-xs font-bold rounded-xl transition-all flex items-center gap-1.5 cursor-pointer shadow-lg shadow-emerald-500/10 font-sans"
+            >
+              <Eye className="h-4 w-4" />
+              <span>{showFullInvoices ? "Thu gọn" : "Xem tất cả hóa đơn"}</span>
+            </button>
           </div>
         </div>
+
+        {/* Filter Inputs Grid (Rendered only when showFullInvoices is true) */}
+        {showFullInvoices && (
+          <div className="space-y-4 border-b border-stone-850 pb-4 animate-fade-in">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+              <div>
+                <label className="text-[10px] text-stone-400 font-bold uppercase block mb-1">Mã hóa đơn</label>
+                <div className="relative">
+                  <Search className="absolute left-3 top-2.5 text-stone-500 h-4 w-4" />
+                  <input
+                    type="text"
+                    placeholder="Tìm mã hóa đơn (e.g. HD000001)..."
+                    value={searchCode}
+                    onChange={(e) => setSearchCode(e.target.value)}
+                    className="w-full pl-9 pr-3 py-2 bg-stone-950 border border-stone-800 text-stone-200 text-xs rounded-xl focus:outline-none focus:border-emerald-500 font-mono placeholder:text-stone-600"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="text-[10px] text-stone-400 font-bold uppercase block mb-1">Tên khách hàng</label>
+                <div className="relative">
+                  <Users className="absolute left-3 top-2.5 text-stone-500 h-4 w-4" />
+                  <input
+                    type="text"
+                    placeholder="Tìm theo tên khách hàng..."
+                    value={searchCustomer}
+                    onChange={(e) => setSearchCustomer(e.target.value)}
+                    className="w-full pl-9 pr-3 py-2 bg-stone-950 border border-stone-800 text-stone-200 text-xs rounded-xl focus:outline-none focus:border-emerald-500 placeholder:text-stone-600"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="text-[10px] text-stone-400 font-bold uppercase block mb-1">Nhân viên / Thu ngân</label>
+                <div className="relative">
+                  <User className="absolute left-3 top-2.5 text-stone-500 h-4 w-4" />
+                  <input
+                    type="text"
+                    placeholder="Tìm theo tên nhân viên..."
+                    value={searchStaff}
+                    onChange={(e) => setSearchStaff(e.target.value)}
+                    className="w-full pl-9 pr-3 py-2 bg-stone-950 border border-stone-800 text-stone-200 text-xs rounded-xl focus:outline-none focus:border-emerald-500 placeholder:text-stone-600"
+                  />
+                </div>
+              </div>
+            </div>
+
+            {/* Time and Date Range selector + E-Invoice filter */}
+            <div className="grid grid-cols-1 xl:grid-cols-2 gap-4 p-4 rounded-xl bg-stone-950/40 border border-stone-850/80">
+              {/* Left: Time Filter */}
+              <div className="flex flex-col sm:flex-row sm:items-center gap-4 justify-between xl:border-r xl:border-stone-850 xl:pr-4">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-[10px] text-stone-400 font-black uppercase tracking-wider mr-2">Bộ lọc thời gian:</span>
+                  <div className="flex flex-wrap gap-1.5 bg-stone-950 p-1 rounded-xl border border-stone-850">
+                    {[
+                      { key: "all", label: "Tất cả" },
+                      { key: "today", label: "Hôm nay" },
+                      { key: "yesterday", label: "Hôm qua" },
+                      { key: "7days", label: "7 ngày qua" },
+                      { key: "30days", label: "30 ngày qua" },
+                      { key: "custom", label: "Chọn khoảng ngày" }
+                    ].map(btn => (
+                      <button
+                        key={btn.key}
+                        onClick={() => setDateFilterType(btn.key as any)}
+                        className={`px-3 py-1 text-xs font-bold rounded-lg transition-all cursor-pointer ${
+                          dateFilterType === btn.key
+                            ? "bg-emerald-500 text-stone-950 shadow-md"
+                            : "text-stone-400 hover:text-stone-250 hover:bg-stone-900"
+                        }`}
+                      >
+                        {btn.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Custom Date Inputs */}
+                {dateFilterType === "custom" && (
+                  <div className="flex items-center gap-3 animate-fade-in">
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-[10px] text-stone-500 font-bold uppercase">Từ ngày:</span>
+                      <input
+                        type="date"
+                        value={startDate}
+                        onChange={(e) => setStartDate(e.target.value)}
+                        className="px-2.5 py-1 bg-stone-950 border border-stone-800 text-stone-300 text-xs rounded-lg focus:outline-none focus:border-emerald-500 font-mono"
+                      />
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-[10px] text-stone-500 font-bold uppercase">Đến ngày:</span>
+                      <input
+                        type="date"
+                        value={endDate}
+                        onChange={(e) => setEndDate(e.target.value)}
+                        className="px-2.5 py-1 bg-stone-950 border border-stone-800 text-stone-300 text-xs rounded-lg focus:outline-none focus:border-emerald-500 font-mono"
+                      />
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Right: E-Invoice Filter */}
+              <div className="flex flex-wrap items-center gap-2 xl:pl-4">
+                <span className="text-[10px] text-indigo-400 font-black uppercase tracking-wider mr-2 flex items-center gap-1">
+                  <Cloud className="h-3.5 w-3.5 shrink-0" />
+                  <span>Thuế & HĐ Điện Tử:</span>
+                </span>
+                <div className="flex flex-wrap gap-1.5 bg-stone-950 p-1 rounded-xl border border-stone-850">
+                  {[
+                    { key: "all", label: "Tất cả" },
+                    { key: "issued", label: "Đã xuất HĐĐT" },
+                    { key: "not_issued", label: "Chưa xuất HĐĐT" }
+                  ].map(btn => (
+                    <button
+                      key={btn.key}
+                      onClick={() => setEInvoiceFilter(btn.key as any)}
+                      className={`px-3 py-1 text-xs font-bold rounded-lg transition-all cursor-pointer flex items-center gap-1 ${
+                        eInvoiceFilter === btn.key
+                          ? "bg-indigo-600 text-white shadow-md font-black"
+                          : "text-stone-400 hover:text-stone-250 hover:bg-stone-900"
+                      }`}
+                    >
+                      <span>{btn.label}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Invoice List Table */}
         <div className="overflow-x-auto rounded-xl border border-stone-850 bg-stone-950/20 max-h-[380px] overflow-y-auto scrollbar-thin">
@@ -2119,14 +2809,14 @@ export default function KiotDashboard({ products, invoices, categories, currentS
               </tr>
             </thead>
             <tbody className="divide-y divide-stone-850/50">
-              {dashboardInvoiceList.length === 0 ? (
+              {(showFullInvoices ? dashboardInvoiceList : dashboardInvoiceList.slice(0, 5)).length === 0 ? (
                 <tr>
                   <td colSpan={9} className="py-12 text-center text-stone-500 font-semibold">
                     Không tìm thấy hóa đơn nào khớp với các điều kiện lọc.
                   </td>
                 </tr>
               ) : (
-                dashboardInvoiceList.map(inv => {
+                (showFullInvoices ? dashboardInvoiceList : dashboardInvoiceList.slice(0, 5)).map(inv => {
                   const formattedDate = new Date(inv.date).toLocaleString("vi-VN", {
                     day: "numeric",
                     month: "numeric",
@@ -2219,143 +2909,6 @@ export default function KiotDashboard({ products, invoices, categories, currentS
           </table>
         </div>
       </div>
-
-      {/* 8. SYSTEM AUDIT LOG */}
-      <div className="p-6 rounded-2xl bg-stone-900 border border-stone-850 space-y-5">
-        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-stone-850 pb-4">
-          <div className="space-y-1">
-            <h3 className="text-sm font-bold text-stone-100 flex items-center gap-2 uppercase tracking-wider">
-              <Activity className="h-4.5 w-4.5 text-amber-500 animate-pulse" />
-              <span>Nhật Ký Hệ Thống (System Audit Log)</span>
-            </h3>
-            <p className="text-xs text-stone-400">Tra cứu dấu vết thao tác nhạy cảm: sửa giá sản phẩm, xóa danh mục, thay đổi phân quyền nhân viên.</p>
-          </div>
-          
-          {/* Clear Filters helper */}
-          {(logSearch || logTypeFilter !== "ALL") && (
-            <button
-              onClick={() => {
-                setLogSearch("");
-                setLogTypeFilter("ALL");
-              }}
-              className="px-3 py-1.5 bg-stone-800 hover:bg-stone-750 text-stone-300 text-xs font-bold rounded-lg transition-colors border border-stone-700 flex items-center gap-1.5 cursor-pointer self-start md:self-auto"
-            >
-              <RefreshCw className="h-3.5 w-3.5" />
-              <span>Xóa bộ lọc</span>
-            </button>
-          )}
-        </div>
-
-        {/* Filters */}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <div>
-            <label className="text-[10px] text-stone-400 font-bold uppercase block mb-1">Tìm kiếm nội dung</label>
-            <div className="relative">
-              <Search className="absolute left-3 top-2.5 text-stone-500 h-4 w-4" />
-              <input
-                type="text"
-                placeholder="Tìm theo người thực hiện, nội dung chi tiết..."
-                value={logSearch}
-                onChange={(e) => setLogSearch(e.target.value)}
-                className="w-full pl-9 pr-3 py-2 bg-stone-950 border border-stone-800 text-stone-200 text-xs rounded-xl focus:outline-none focus:border-emerald-500 placeholder:text-stone-600"
-              />
-            </div>
-          </div>
-
-          <div>
-            <label className="text-[10px] text-stone-400 font-bold uppercase block mb-1">Loại thao tác</label>
-            <select
-              value={logTypeFilter}
-              onChange={(e) => setLogTypeFilter(e.target.value)}
-              className="w-full p-2 bg-stone-950 border border-stone-800 rounded-xl text-stone-200 text-xs focus:outline-none focus:border-emerald-500 cursor-pointer"
-            >
-              <option value="ALL">-- Tất cả thao tác --</option>
-              <option value="PRODUCT_PRICE_EDIT">Chỉnh sửa giá sản phẩm</option>
-              <option value="CATEGORY_DELETE">Xóa danh mục</option>
-              <option value="CATEGORY_CREATE">Thêm danh mục mới</option>
-              <option value="STAFF_PERMISSION_CHANGE">Thay đổi phân quyền nhân viên</option>
-              <option value="PRODUCT_CREATE">Thêm sản phẩm mới</option>
-              <option value="PRODUCT_DELETE">Xóa sản phẩm</option>
-              <option value="STAFF_CREATE">Thêm nhân viên mới</option>
-              <option value="STAFF_DELETE">Xóa nhân viên</option>
-            </select>
-          </div>
-        </div>
-
-        {/* Audit Log Table */}
-        <div className="overflow-x-auto rounded-xl border border-stone-850 bg-stone-950/20 max-h-[350px] overflow-y-auto scrollbar-thin">
-          <table className="w-full text-left text-xs border-collapse">
-            <thead>
-              <tr className="border-b border-stone-800 bg-stone-950 text-stone-400 sticky top-0 z-10">
-                <th className="py-2 px-3 font-bold uppercase tracking-wider w-40">Thời gian</th>
-                <th className="py-2 px-3 font-bold uppercase tracking-wider w-56">Thao tác</th>
-                <th className="py-2 px-3 font-bold uppercase tracking-wider w-48">Người thực hiện</th>
-                <th className="py-2 px-3 font-bold uppercase tracking-wider">Chi tiết nội dung thay đổi</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-stone-850/50">
-              {filteredLogs.length === 0 ? (
-                <tr>
-                  <td colSpan={4} className="py-12 text-center text-stone-500 font-semibold">
-                    Không tìm thấy nhật ký hệ thống nào khớp với điều kiện lọc.
-                  </td>
-                </tr>
-              ) : (
-                filteredLogs.map(log => {
-                  const formattedTime = new Date(log.timestamp).toLocaleString("vi-VN", {
-                    day: "numeric",
-                    month: "numeric",
-                    year: "numeric",
-                    hour: "2-digit",
-                    minute: "2-digit",
-                    second: "2-digit"
-                  });
-
-                  // Color mapping based on actionType
-                  let badgeClass = "bg-stone-500/10 text-stone-400 border border-stone-500/20";
-                  if (log.actionType === "PRODUCT_PRICE_EDIT") {
-                    badgeClass = "bg-amber-500/10 text-amber-400 border border-amber-500/15";
-                  } else if (log.actionType === "CATEGORY_DELETE" || log.actionType === "PRODUCT_DELETE" || log.actionType === "STAFF_DELETE") {
-                    badgeClass = "bg-rose-500/10 text-rose-400 border border-rose-500/15";
-                  } else if (log.actionType === "STAFF_PERMISSION_CHANGE") {
-                    badgeClass = "bg-indigo-500/10 text-indigo-400 border border-indigo-500/15";
-                  } else if (log.actionType === "PRODUCT_CREATE" || log.actionType === "CATEGORY_CREATE" || log.actionType === "STAFF_CREATE") {
-                    badgeClass = "bg-emerald-500/10 text-emerald-400 border border-emerald-500/15";
-                  }
-
-                  return (
-                    <tr key={log.id} className="hover:bg-stone-950/40 transition-all">
-                      <td className="py-3 px-3 font-mono text-stone-400">
-                        <div className="flex items-center gap-1.5">
-                          <Clock className="h-3.5 w-3.5 text-stone-600" />
-                          <span>{formattedTime}</span>
-                        </div>
-                      </td>
-                      <td className="py-3 px-3">
-                        <span className={`px-2.5 py-1 rounded-lg text-[10px] font-bold tracking-wide ${badgeClass}`}>
-                          {log.actionName}
-                        </span>
-                      </td>
-                      <td className="py-3 px-3">
-                        <div className="space-y-0.5 leading-none">
-                          <span className="font-bold text-stone-250 block">{log.actorName}</span>
-                          <span className="text-[9px] text-stone-500 font-bold uppercase tracking-wider block">
-                            {log.actorRole === "OWNER" ? "Chủ shop" : log.actorRole === "MANAGER" ? "Quản lý" : "Thu ngân"}
-                          </span>
-                        </div>
-                      </td>
-                      <td className="py-3 px-3 text-stone-300 leading-relaxed max-w-md break-words">
-                        {log.description}
-                      </td>
-                    </tr>
-                  );
-                })
-              )}
-            </tbody>
-          </table>
-        </div>
-      </div>
-
       {/* DETAILED RECEIPT MODAL FOR SELECTED INVOICE */}
       {selectedInvoice && (
         <div className="fixed inset-0 bg-stone-950/85 backdrop-blur-md z-50 flex items-center justify-center p-4 animate-fade-in">

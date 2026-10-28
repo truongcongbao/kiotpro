@@ -31,8 +31,34 @@ export default function BarcodeScannerModal({
   const [manualCode, setManualCode] = useState<string>("");
 
   const scannerRef = useRef<Html5Qrcode | null>(null);
-  const lastScannedCode = useRef<string>("");
+  const lastScannedCode = useRef<string>(null as any);
   const lastScannedTime = useRef<number>(0);
+  const isTransitioningRef = useRef<boolean>(false);
+  const shouldStopRef = useRef<boolean>(false);
+  const isMountedRef = useRef<boolean>(false);
+
+  // Safe stop scanner helper that avoids state transition conflicts
+  const safeStopScanner = async () => {
+    shouldStopRef.current = true;
+    if (isTransitioningRef.current) {
+      return;
+    }
+    const scanner = scannerRef.current;
+    if (!scanner) return;
+    try {
+      const state = scanner.getState();
+      // 2 = SCANNING, 3 = PAUSED
+      if (state === 2 || state === 3) {
+        await scanner.stop();
+      }
+      setIsActive(false);
+    } catch (err: any) {
+      const errStr = String(err || "");
+      if (!errStr.includes("Cannot transition") && !errStr.includes("not running")) {
+        console.warn("Scanner stop handled:", err);
+      }
+    }
+  };
 
   // Play standard barcode scanner beep sound
   const playBeep = () => {
@@ -89,8 +115,11 @@ export default function BarcodeScannerModal({
   };
 
   const startScanning = async (scanner: Html5Qrcode, cameraConfig: any) => {
+    if (isTransitioningRef.current) return;
     setIsLoading(true);
     setErrorMsg("");
+    isTransitioningRef.current = true;
+
     try {
       await scanner.start(
         cameraConfig,
@@ -119,26 +148,47 @@ export default function BarcodeScannerModal({
           // Error handler (silent frame reading errors)
         }
       );
-      setIsActive(true);
+
+      // If user closed modal while camera was spinning up
+      if (shouldStopRef.current || !isMountedRef.current) {
+        try {
+          const state = scanner.getState();
+          if (state === 2 || state === 3) {
+            await scanner.stop();
+          }
+        } catch (_) {}
+        setIsActive(false);
+      } else {
+        setIsActive(true);
+      }
     } catch (err: any) {
+      const errStr = String(err || "");
+      if (errStr.includes("Cannot transition")) {
+        // Silently swallow transition overlap error
+        return;
+      }
       console.error("Scanner start failed:", err);
-      setErrorMsg("Không thể kết nối máy ảnh. Vui lòng kiểm tra quyền camera hoặc chọn một camera khác.");
+      if (errStr.includes("NotAllowedError") || errStr.includes("Permission denied") || errStr.includes("permission") || errStr.includes("userMedia")) {
+        setErrorMsg("PERMISSION_DENIED");
+      } else {
+        setErrorMsg("Không thể kết nối máy ảnh. Vui lòng kiểm tra quyền camera hoặc chọn một camera khác.");
+      }
     } finally {
+      isTransitioningRef.current = false;
       setIsLoading(false);
     }
   };
 
   // Change camera trigger
   const handleCameraChange = async (cameraId: string) => {
-    if (!scannerRef.current) return;
+    if (!scannerRef.current || isTransitioningRef.current) return;
     setSelectedCameraId(cameraId);
     
     try {
-      if (scannerRef.current.isScanning) {
-        await scannerRef.current.stop();
-        setIsActive(false);
+      await safeStopScanner();
+      if (isMountedRef.current && isOpen && scannerRef.current) {
+        await startScanning(scannerRef.current, cameraId);
       }
-      await startScanning(scannerRef.current, cameraId);
     } catch (error) {
       console.error("Failed to switch camera:", error);
     }
@@ -154,18 +204,25 @@ export default function BarcodeScannerModal({
   };
 
   useEffect(() => {
-    if (!isOpen) return;
+    if (!isOpen) {
+      setIsActive(false);
+      return;
+    }
     
+    isMountedRef.current = true;
+    shouldStopRef.current = false;
     const elementId = "pos-scanner-viewport";
     let html5Qrcode: Html5Qrcode;
     
     // Set up brief timeout to guarantee DOM mounting before initializing scanner
     const timer = setTimeout(() => {
+      if (!isMountedRef.current || shouldStopRef.current) return;
       try {
         html5Qrcode = new Html5Qrcode(elementId);
         scannerRef.current = html5Qrcode;
         
         Html5Qrcode.getCameras().then(devices => {
+          if (!isMountedRef.current || shouldStopRef.current) return;
           if (devices && devices.length > 0) {
             setCameras(devices);
             // Search back camera default
@@ -182,6 +239,7 @@ export default function BarcodeScannerModal({
             startScanning(html5Qrcode, { facingMode: "environment" });
           }
         }).catch(err => {
+          if (!isMountedRef.current || shouldStopRef.current) return;
           console.warn("Camera enumeration failed, trying direct start:", err);
           startScanning(html5Qrcode, { facingMode: "environment" });
         });
@@ -193,14 +251,10 @@ export default function BarcodeScannerModal({
     }, 200);
 
     return () => {
+      isMountedRef.current = false;
+      shouldStopRef.current = true;
       clearTimeout(timer);
-      if (scannerRef.current && scannerRef.current.isScanning) {
-        scannerRef.current.stop()
-          .then(() => {
-            console.log("Scanner stopped.");
-          })
-          .catch(err => console.error("Error stopping scanner:", err));
-      }
+      safeStopScanner();
     };
   }, [isOpen]);
 
@@ -236,16 +290,46 @@ export default function BarcodeScannerModal({
             </div>
 
             {/* Error Message banner */}
-            {errorMsg && (
+            {errorMsg === "PERMISSION_DENIED" ? (
+              <div className="p-4 rounded-xl bg-amber-950/30 border border-amber-500/20 text-amber-400 text-xs space-y-2 animate-fadeIn">
+                <div className="flex items-center gap-2 font-bold text-amber-300">
+                  <AlertTriangle className="h-4 w-4 shrink-0" />
+                  <span>Quyền truy cập Camera bị chặn (Permission Denied) 🔒</span>
+                </div>
+                <div className="pl-6 space-y-1 text-[11px] leading-relaxed text-stone-300">
+                  <p>Để bắt đầu quét mã vạch sản phẩm bằng camera, quý khách vui lòng:</p>
+                  <ol className="list-decimal pl-4 space-y-1">
+                    <li>Click vào <strong>biểu tượng ổ khóa hoặc camera</strong> ở góc trái thanh địa chỉ trình duyệt.</li>
+                    <li>Chọn <strong>"Cho phép" (Allow)</strong> cho quyền truy cập máy ảnh.</li>
+                    <li>Hoặc click vào nút <strong>"Mở trong tab mới" (Open in new tab)</strong> ở góc trên bên phải trang web, sau đó bật tính năng quét mã.</li>
+                  </ol>
+                  <p className="text-[10px] text-amber-400 font-medium italic mt-1">Mẹo: Bạn có thể nhập nhanh mã vạch/mã sản phẩm vào ô nhập thủ công ở góc phải để thêm sản phẩm ngay mà không cần camera!</p>
+                </div>
+              </div>
+            ) : errorMsg ? (
               <div className="p-3.5 rounded-xl bg-rose-950/40 border border-rose-900/30 text-rose-400 text-xs flex items-start gap-2 animate-fadeIn">
                 <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
                 <span>{errorMsg}</span>
               </div>
-            )}
+            ) : null}
 
             {/* LIVE VIEWER STAGE */}
             <div className="relative rounded-2xl border border-stone-850 overflow-hidden bg-stone-950 aspect-[4/3] flex items-center justify-center">
-              <div id="pos-scanner-viewport" className="w-full h-full object-cover [&>video]:w-full [&>video]:h-full [&>video]:object-cover" />
+              {errorMsg === "PERMISSION_DENIED" ? (
+                <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center space-y-3 bg-stone-950">
+                  <div className="h-12 w-12 rounded-full bg-stone-900 border border-stone-800 flex items-center justify-center text-amber-400">
+                    <Camera className="h-6 w-6" />
+                  </div>
+                  <div className="space-y-1 max-w-sm">
+                    <h4 className="text-xs font-bold text-stone-300">Yêu cầu quyền truy cập Camera</h4>
+                    <p className="text-[10px] text-stone-500 leading-normal">
+                      Hãy cấp quyền sử dụng camera trong cài đặt trình duyệt của bạn hoặc mở website trong một tab mới để sử dụng tính năng này.
+                    </p>
+                  </div>
+                </div>
+              ) : (
+                <div id="pos-scanner-viewport" className="w-full h-full object-cover [&>video]:w-full [&>video]:h-full [&>video]:object-cover" />
+              )}
               
               {/* Scan viewport laser animation frame overlay */}
               {isActive && (
